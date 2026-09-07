@@ -25,7 +25,7 @@ OWNER_TELEGRAM_ID = os.environ.get("OWNER_TELEGRAM_ID", "")
 
 # --- AI Provider: Google Gemini (free tier, no card required) ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-AI_MODEL = "gemini-2.0-flash"
+AI_MODEL = "gemini-3.6-flash"
 
 # --- Database: Supabase (Postgres) ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
