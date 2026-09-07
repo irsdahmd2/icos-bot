@@ -433,3 +433,18 @@ def get_per_product_dashboard():
             "confirmed_published": confirmed_published,
         })
     return rows
+
+
+# ---------- Simple key-value settings (used for the pinned live dashboard) ----------
+
+def get_setting(key: str):
+    res = get_client().table("bot_settings").select("value").eq("key", key).execute()
+    return res.data[0]["value"] if res.data else None
+
+
+def set_setting(key: str, value: str):
+    existing = get_client().table("bot_settings").select("key").eq("key", key).execute()
+    if existing.data:
+        get_client().table("bot_settings").update({"value": value}).eq("key", key).execute()
+    else:
+        get_client().table("bot_settings").insert({"key": key, "value": value}).execute()

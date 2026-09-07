@@ -23,6 +23,7 @@ from telegram.ext import (
 import config
 import database as db
 import pipeline
+import ai_client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("icos")
@@ -139,12 +140,14 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+DASHBOARD_MSG_ID_KEY = "pinned_dashboard_message_id"
+
+
+def _render_dashboard_text():
     rows = db.get_per_product_dashboard()
     if not rows:
-        await update.message.reply_text("No products uploaded yet.")
-        return
-    lines = ["📊 Dashboard\n"]
+        return "📊 Dashboard (live)\n\nNo products uploaded yet."
+    lines = ["📊 Dashboard (live — stays updated in place)\n"]
     for i, r in enumerate(rows, 1):
         lines.append(
             f"{i}. {r['product_name']}\n"
@@ -152,7 +155,32 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"   ✍️ Posts generated: {r['posts_generated']} | ✅ Audit passed: {r['audit_passed']} "
             f"| 📤 Confirmed published: {r['confirmed_published']}"
         )
-    await update.message.reply_text("\n\n".join(lines))
+    return "\n\n".join(lines)
+
+
+async def refresh_pinned_dashboard(chat_id, context: ContextTypes.DEFAULT_TYPE):
+    """Keeps ONE message updated in place with current stats, pinned to the
+    top — so you can delete every other message in the chat each day and
+    this one stays put with the real numbers."""
+    text = _render_dashboard_text()
+    msg_id = db.get_setting(DASHBOARD_MSG_ID_KEY)
+    if msg_id:
+        try:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=int(msg_id), text=text)
+            return
+        except Exception as e:
+            logger.info(f"Pinned dashboard message gone, sending a fresh one: {e}")
+
+    sent = await context.bot.send_message(chat_id=chat_id, text=text)
+    try:
+        await context.bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id, disable_notification=True)
+    except Exception as e:
+        logger.warning(f"Could not pin dashboard message: {e}")
+    db.set_setting(DASHBOARD_MSG_ID_KEY, str(sent.message_id))
+
+
+async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await refresh_pinned_dashboard(update.effective_chat.id, context)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -179,27 +207,60 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Only used for the one moment a plain-text reply is expected: the
-    product name after a PDF upload. Everything else is buttons."""
+    """Two jobs: (1) capture the product name right after a PDF upload, or
+    (2) if that's not what's happening, treat the message as a plain-language
+    question about real stats (KUs, posts, audits, published counts) and
+    answer it using the actual database — not a guess."""
     if not _owner_only(update):
         return
     chat_id = update.effective_chat.id
     pending = _pending_uploads.get(chat_id)
-    if not pending or "product_name" in pending:
-        return  # not waiting for a name right now — ignore stray text
+    if pending and "product_name" not in pending:
+        product_name = update.message.text.strip()
+        pending["product_name"] = product_name
 
-    product_name = update.message.text.strip()
-    pending["product_name"] = product_name
+        keyboard = [[
+            InlineKeyboardButton("Full OS (150+ pages)", callback_data=f"tier|{chat_id}|Full_OS"),
+            InlineKeyboardButton("Handbook (35-50p)", callback_data=f"tier|{chat_id}|Handbook"),
+            InlineKeyboardButton("Codex (6-10p)", callback_data=f"tier|{chat_id}|Codex"),
+        ]]
+        await update.message.reply_text(
+            f"✅ Confirmed: {product_name}\nWhich tier is this document?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
 
-    keyboard = [[
-        InlineKeyboardButton("Full OS (150+ pages)", callback_data=f"tier|{chat_id}|Full_OS"),
-        InlineKeyboardButton("Handbook (35-50p)", callback_data=f"tier|{chat_id}|Handbook"),
-        InlineKeyboardButton("Codex (6-10p)", callback_data=f"tier|{chat_id}|Codex"),
-    ]]
-    await update.message.reply_text(
-        f"✅ Confirmed: {product_name}\nWhich tier is this document?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+    await _answer_stats_question(update, context)
+
+
+async def _answer_stats_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Answers plain-language questions like 'how many KUs for HOS Handbook'
+    or 'how many posts published so far' using the REAL numbers from the
+    database — never a guess. If nothing's been uploaded yet, says so plainly."""
+    rows = db.get_per_product_dashboard()
+    if not rows:
+        await update.message.reply_text("No products uploaded yet, so there's nothing to report on.")
+        return
+
+    stats_summary = "\n".join(
+        f"- {r['product_name']} (code {r['product_id']}): "
+        f"Full OS KUs={r['Full_OS']}, Handbook KUs={r['Handbook']}, Codex KUs={r['Codex']}, "
+        f"posts_generated={r['posts_generated']}, audit_passed={r['audit_passed']}, "
+        f"confirmed_published={r['confirmed_published']}"
+        for r in rows
     )
+    prompt = (
+        "You are ICOS's data assistant. Answer the user's question using ONLY the real data "
+        "below — never invent a number. Reply in one or two short plain sentences, no markdown, "
+        "no headers. If the question doesn't match any product name closely, say which products "
+        "you do have data for instead of guessing.\n\n"
+        f"DATA:\n{stats_summary}\n\nQUESTION: {update.message.text.strip()}"
+    )
+    response = ai_client.get_client().messages.create(
+        model=config.AI_MODEL, max_tokens=300,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    await update.message.reply_text(response.content[0].text.strip())
 
 
 async def handle_tier_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -212,11 +273,7 @@ async def handle_tier_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("⚠️ Upload expired — please send the PDF again.")
         return
 
-    await query.edit_message_text(
-        f"⏳ Please wait — extracting Knowledge Units ({tier}). This only builds the raw "
-        f"knowledge base; actual posts per platform are created next, on demand, when you "
-        f"tap Generate Today's Post."
-    )
+    await query.edit_message_text("⏳ Processing... please wait.")
     result = await asyncio.to_thread(
         pipeline.process_new_product,
         product_name=pending["product_name"], tier=tier,
@@ -226,13 +283,12 @@ async def handle_tier_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=(f"✅ Extraction complete.\n\n"
-              f"Product: {result['product_name']} ({result['product_id']})\n"
-              f"Tier: {result['tier']}\n"
-              f"📚 Knowledge Units extracted: {result['ku_count']}\n\n"
-              f"No posts have been generated yet — that happens next, per platform, "
-              f"whenever you tap Generate Today's Post.")
+        text=(f"✅ Processing complete.\n\n"
+              f"Product: {result['product_name']}\n"
+              f"Tier: {result['tier']}\n\n"
+              f"Ready to generate posts — tap Generate Today's Post whenever you're ready.")
     )
+    await refresh_pinned_dashboard(chat_id, context)
     await send_welcome(chat_id, context)
 
 
@@ -309,7 +365,7 @@ async def handle_platform_choice(update: Update, context: ContextTypes.DEFAULT_T
     products = {p["product_id"]: p for p in db.get_all_products()}
     product_name = products.get(product_id, {}).get("product_name", product_id)
 
-    await query.edit_message_text(f"⏳ Generating {PLATFORM_LABELS.get(platform, platform)}...")
+    await query.edit_message_text("⏳ Processing... please wait.")
     result = await asyncio.to_thread(pipeline.generate_for_platform, product_id, product_name, tier, platform)
 
     if "error" in result:
@@ -323,6 +379,7 @@ async def handle_platform_choice(update: Update, context: ContextTypes.DEFAULT_T
         reply_markup=_action_keyboard(result["content_id"], can_publish),
     )
     db.update_content_status(result["content_id"], "telegram_delivered")
+    await refresh_pinned_dashboard(query.message.chat_id, context)
 
 
 async def handle_refine(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -333,7 +390,7 @@ async def handle_refine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     products = {p["product_id"]: p for p in db.get_all_products()}
     product_name = products.get(old["product_id"], {}).get("product_name", old["product_id"]) if old else ""
 
-    await query.edit_message_text("🔁 Refining...")
+    await query.edit_message_text("⏳ Processing... please wait.")
     result = await asyncio.to_thread(pipeline.refine, content_id, product_name)
     if "error" in result:
         await context.bot.send_message(chat_id=query.message.chat_id, text=f"⚠️ {result['error']}")
@@ -346,6 +403,7 @@ async def handle_refine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=_action_keyboard(result["content_id"], can_publish),
     )
     db.update_content_status(result["content_id"], "telegram_delivered")
+    await refresh_pinned_dashboard(query.message.chat_id, context)
 
 
 async def handle_ready_to_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -365,6 +423,7 @@ async def handle_confirm_published(update: Update, context: ContextTypes.DEFAULT
     _, content_id = query.data.split("|")
     pipeline.mark_confirmed_published(content_id)
     await query.edit_message_text(query.message.text + "\n\n✅ CONFIRMED PUBLISHED. Dashboard updated.")
+    await refresh_pinned_dashboard(query.message.chat_id, context)
     # Immediately show what's left today, instead of leaving you at a dead end.
     await context.bot.send_message(
         chat_id=query.message.chat_id,
