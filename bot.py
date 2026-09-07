@@ -40,13 +40,32 @@ def _owner_only(update: Update) -> bool:
     return str(update.effective_user.id) == str(config.OWNER_TELEGRAM_ID)
 
 
-async def _safe_answer(query):
-    """Answers a button tap, but quietly ignores the harmless 'query is too
-    old' Telegram error — this happens when a button sits on screen for a
-    while, gets double-tapped, or the bot was mid-task when it was pressed.
-    It means nothing was lost; there's just nothing useful to tell the user."""
+async def _send_with_retry(context: ContextTypes.DEFAULT_TYPE, chat_id, text, reply_markup=None, attempts=3):
+    """Sends a message, retrying a couple of times on a transient network
+    blip (dropped connection, brief mobile network hiccup) instead of losing
+    the result of a long-running extraction/generation call. Only network
+    errors are retried — a real bug still surfaces immediately."""
+    from telegram.error import NetworkError, TimedOut
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+        except (NetworkError, TimedOut) as e:
+            last_error = e
+            logger.warning(f"send_message network hiccup (attempt {attempt}/{attempts}): {e}")
+            await asyncio.sleep(2 * attempt)
+    logger.error(f"send_message failed after {attempts} attempts: {last_error}")
+    raise last_error
+
+
+async def _safe_answer(query, text: str = None):
+    """Answers a button tap with a brief visible toast (so you always see
+    SOMETHING happened, even before the fuller response arrives) and quietly
+    ignores the harmless 'query is too old' Telegram error — that happens
+    when a button sits on screen a while, gets double-tapped, or the bot was
+    mid-task when it was pressed. It means nothing was lost."""
     try:
-        await query.answer()
+        await query.answer(text=text) if text else await query.answer()
     except Exception as e:
         logger.info(f"Ignored stale callback query: {e}")
 
@@ -82,10 +101,10 @@ def _todays_progress_text():
 
 
 def _main_menu_keyboard():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📤 Upload New Product", callback_data="menu|upload"),
-        InlineKeyboardButton("✍️ Generate Today's Post", callback_data="menu|generate"),
-    ]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Upload New Product", callback_data="menu|upload")],
+        [InlineKeyboardButton("✍️ Generate Today's Post", callback_data="menu|generate")],
+    ])
 
 
 async def send_welcome(chat_id, context: ContextTypes.DEFAULT_TYPE):
@@ -108,7 +127,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_menu_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await _safe_answer(query)
+    await _safe_answer(query, "Got it")
     _, choice = query.data.split("|")
     if choice == "upload":
         await context.bot.send_message(
@@ -219,11 +238,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         product_name = update.message.text.strip()
         pending["product_name"] = product_name
 
-        keyboard = [[
-            InlineKeyboardButton("Full OS (150+ pages)", callback_data=f"tier|{chat_id}|Full_OS"),
-            InlineKeyboardButton("Handbook (35-50p)", callback_data=f"tier|{chat_id}|Handbook"),
-            InlineKeyboardButton("Codex (6-10p)", callback_data=f"tier|{chat_id}|Codex"),
-        ]]
+        keyboard = [
+            [InlineKeyboardButton("Full OS (150+ pages)", callback_data=f"tier|{chat_id}|Full_OS")],
+            [InlineKeyboardButton("Handbook (35-50p)", callback_data=f"tier|{chat_id}|Handbook")],
+            [InlineKeyboardButton("Codex (6-10p)", callback_data=f"tier|{chat_id}|Codex")],
+        ]
         await update.message.reply_text(
             f"✅ Confirmed: {product_name}\nWhich tier is this document?",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -265,7 +284,7 @@ async def _answer_stats_question(update: Update, context: ContextTypes.DEFAULT_T
 
 async def handle_tier_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await _safe_answer(query)
+    await _safe_answer(query, "Tier selected")
     _, chat_id_str, tier = query.data.split("|")
     chat_id = int(chat_id_str)
     pending = _pending_uploads.get(chat_id)
@@ -281,8 +300,8 @@ async def handle_tier_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     del _pending_uploads[chat_id]
 
-    await context.bot.send_message(
-        chat_id=chat_id,
+    await _send_with_retry(
+        context, chat_id,
         text=(f"✅ Processing complete.\n\n"
               f"Product: {result['product_name']}\n"
               f"Tier: {result['tier']}\n\n"
@@ -350,16 +369,16 @@ def _format_delivery(result: dict) -> str:
 
 
 def _action_keyboard(content_id: str, can_publish: bool) -> InlineKeyboardMarkup:
-    row1 = [InlineKeyboardButton("🔁 Refine", callback_data=f"refine|{content_id}")]
+    rows = [[InlineKeyboardButton("🔁 Refine", callback_data=f"refine|{content_id}")]]
     if can_publish:
-        row1.append(InlineKeyboardButton("📤 Ready to Publish", callback_data=f"ready|{content_id}"))
-    row2 = [InlineKeyboardButton("✅ Confirm Published", callback_data=f"confirm|{content_id}")]
-    return InlineKeyboardMarkup([row1, row2])
+        rows.append([InlineKeyboardButton("📤 Ready to Publish", callback_data=f"ready|{content_id}")])
+    rows.append([InlineKeyboardButton("✅ Confirm Published", callback_data=f"confirm|{content_id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def handle_platform_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await _safe_answer(query)
+    await _safe_answer(query, "Starting generation")
     _, product_id, tier, platform = query.data.split("|")
 
     products = {p["product_id"]: p for p in db.get_all_products()}
@@ -373,8 +392,8 @@ async def handle_platform_choice(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     can_publish = result["audit_status"] == "PASS"
-    await context.bot.send_message(
-        chat_id=query.message.chat_id,
+    await _send_with_retry(
+        context, query.message.chat_id,
         text=_format_delivery(result),
         reply_markup=_action_keyboard(result["content_id"], can_publish),
     )
@@ -384,7 +403,7 @@ async def handle_platform_choice(update: Update, context: ContextTypes.DEFAULT_T
 
 async def handle_refine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await _safe_answer(query)
+    await _safe_answer(query, "Refining")
     _, content_id = query.data.split("|")
     old = db.get_content(content_id)
     products = {p["product_id"]: p for p in db.get_all_products()}
@@ -397,8 +416,8 @@ async def handle_refine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     can_publish = result["audit_status"] == "PASS"
-    await context.bot.send_message(
-        chat_id=query.message.chat_id,
+    await _send_with_retry(
+        context, query.message.chat_id,
         text=_format_delivery(result),
         reply_markup=_action_keyboard(result["content_id"], can_publish),
     )
@@ -408,7 +427,7 @@ async def handle_refine(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_ready_to_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await _safe_answer(query)
+    await _safe_answer(query, "Marked")
     _, content_id = query.data.split("|")
     pipeline.mark_ready_to_publish(content_id)
     await query.edit_message_text(
@@ -419,7 +438,7 @@ async def handle_ready_to_publish(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_confirm_published(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await _safe_answer(query)
+    await _safe_answer(query, "Confirmed")
     _, content_id = query.data.split("|")
     pipeline.mark_confirmed_published(content_id)
     await query.edit_message_text(query.message.text + "\n\n✅ CONFIRMED PUBLISHED. Dashboard updated.")
@@ -455,7 +474,16 @@ def _extract_pdf_text(pdf_bytes: bytes) -> str:
 
 def main():
     db.init_db()
-    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    app = (
+        Application.builder()
+        .token(config.TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
