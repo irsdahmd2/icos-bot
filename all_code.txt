@@ -1,0 +1,1289 @@
+"""
+ICOS Master Telegram Bot
+Implements the LOCKED architecture: ONE bot, not per-platform (blueprint Section 8A).
+7Commands: /start, /upload (via file), /generate <PRODUCT_CODE>, /approve, /reject, /status
+"""
+
+import logging
+import os
+import tempfile
+
+from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+)
+
+import config
+import database as db
+import pipeline
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# Holds the most recent generated bundle in memory, keyed by chat_id,
+# so /approve and /reject know what they're acting on. Simple V1 approach.
+PENDING_BUNDLES = {}
+
+
+def _owner_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        if config.OWNER_TELEGRAM_ID and user_id != config.OWNER_TELEGRAM_ID:
+            await update.message.reply_text("This bot is private.")
+            return
+        if not config.OWNER_TELEGRAM_ID:
+            await update.message.reply_text(
+                f"⚠️ Note: OWNER_TELEGRAM_ID is not set yet. Your Telegram ID is: {user_id}\n"
+                f"Add this to config.py or as an environment variable to lock the bot to you."
+            )
+        return await func(update, context)
+    return wrapper
+
+
+@_owner_only
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Welcome to ICOS — INAYA Content Automation.\n\n"
+        "Commands:\n"
+        "📄 Send me a product file (.txt or .pdf-as-text) to extract knowledge from it.\n"
+        "/generate CODE — generate today's content bundle for a product (e.g. /generate WPPS)\n"
+        "/approve — approve all passing content in the current bundle\n"
+        "/approve_platform PLATFORM — approve just one platform (e.g. /approve_platform linkedin)\n"
+        "/reject — reject the current bundle\n"
+        "/status — show system status\n"
+    )
+
+
+@_owner_only
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    products, kus, published = db.get_status_counts()
+    await update.message.reply_text(
+        f"📊 ICOS Status\n\n"
+        f"Products uploaded: {products}\n"
+        f"Knowledge Units extracted: {kus}\n"
+        f"Content published so far: {published}\n"
+    )
+
+
+@_owner_only
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User uploads a product file. We extract text and run the extraction pipeline."""
+    doc = update.message.document
+    filename = doc.file_name
+
+    await update.message.reply_text(f"📥 Received: {filename}\nDownloading...")
+
+    file = await context.bot.get_file(doc.file_id)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp:
+        await file.download_to_drive(tmp.name)
+        tmp_path = tmp.name
+
+    text = _extract_text(tmp_path, filename)
+    if not text or len(text.strip()) < 50:
+        await update.message.reply_text(
+            "⚠️ Couldn't read meaningful text from that file. "
+            "For V1, plain .txt files work most reliably. PDF support is basic."
+        )
+        return
+
+    await update.message.reply_text(
+        "Which product is this?\n"
+        + "\n".join(f"• {code} — {name}" for code, name in config.PRODUCTS.items())
+        + "\n\nReply with the PRODUCT_CODE only (e.g. WPPS)"
+    )
+    context.user_data["pending_upload_text"] = text
+    context.user_data["pending_upload_filename"] = filename
+
+
+@_owner_only
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catches the product-code reply after a document upload, and other free text."""
+    text = update.message.text.strip()
+
+    if "pending_upload_text" in context.user_data:
+        product_id = text.split()[0].upper() if text.split() else ""
+        if product_id not in config.PRODUCTS:
+            await update.message.reply_text("Please reply with just the PRODUCT_CODE.\nExample: WPPS")
+            return
+
+        context.user_data["pending_product_id"] = product_id
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Full Operating System", callback_data="tier:Full_OS")],
+            [InlineKeyboardButton("Handbook", callback_data="tier:Handbook")],
+            [InlineKeyboardButton("Codex", callback_data="tier:Codex")],
+        ])
+        await update.message.reply_text(
+            f"📄 {config.PRODUCTS[product_id]} received.\nPlease confirm the tier.",
+            reply_markup=keyboard
+        )
+        return
+
+    await update.message.reply_text("Send /start to see available commands.")
+
+
+@_owner_only
+async def handle_tier_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles tier button taps after a product code has been confirmed."""
+    query = update.callback_query
+    await query.answer()
+    tier = query.data.split(":", 1)[1]
+
+    product_id = context.user_data.pop("pending_product_id", None)
+    product_text = context.user_data.pop("pending_upload_text", None)
+    filename = context.user_data.pop("pending_upload_filename", None)
+
+    if not product_id or product_text is None or filename is None:
+        await query.edit_message_text("⚠️ Session expired. Please upload the file again.")
+        return
+
+    product_name = config.PRODUCTS[product_id]
+    await query.edit_message_text(f"✅ {product_name} — {tier} confirmed.\nStarting knowledge extraction...")
+
+    ku_ids = pipeline.process_new_product(product_id, product_name, tier, filename, product_text)
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=(
+            f"✅ Done. Extracted {len(ku_ids)} Knowledge Units from {product_name}.\n\n"
+            f"Ready to generate content. Send:\n/generate {product_id}"
+        )
+    )
+
+
+@_owner_only
+async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /generate PRODUCT_CODE  (e.g. /generate WPPS)")
+        return
+
+    product_id = context.args[0].upper()
+    if product_id not in config.PRODUCTS:
+        await update.message.reply_text(f"Unknown product code. Options: {', '.join(config.PRODUCTS)}")
+        return
+
+    product_name = config.PRODUCTS[product_id]
+    await update.message.reply_text(f"⚙️ Generating today's content bundle for {product_name}...\nThis takes a minute or two.")
+
+    bundle = pipeline.generate_daily_bundle(product_id, product_name)
+    if not bundle:
+        await update.message.reply_text(
+            f"No unused Knowledge Units found for {product_name}. "
+            f"Upload a product document first."
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    PENDING_BUNDLES[chat_id] = bundle
+
+    msg = (
+        f"═══════════════════════════\n"
+        f"📌 DAILY CONTENT — {product_name}\n"
+        f"KU: {bundle['ku_core_insight'][:100]}...\n"
+        f"═══════════════════════════\n\n"
+    )
+    await update.message.reply_text(msg)
+
+    for r in bundle["platform_results"]:
+        icon = "✅" if r["audit_status"] == "PASS" else "❌"
+        preview = r["content_text"][:600]
+        reasons = ""
+        if r["audit_status"] == "FAIL":
+            reasons = "\nReasons: " + "; ".join(r["audit_result"].get("failure_reasons", []))
+        await update.message.reply_text(
+            f"{icon} {r['platform'].upper()} — {r['audit_status']}\n\n{preview}{reasons}"
+        )
+
+    await update.message.reply_text(
+        "What next?\n"
+        "/approve — approve all PASSING platforms\n"
+        "/approve_platform NAME — approve just one\n"
+        "/reject — reject everything in this bundle"
+    )
+
+
+@_owner_only
+async def approve_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    bundle = PENDING_BUNDLES.get(chat_id)
+    if not bundle:
+        await update.message.reply_text("No pending bundle. Run /generate PRODUCT_CODE first.")
+        return
+
+    approved = 0
+    for r in bundle["platform_results"]:
+        if r["audit_status"] == "PASS":
+            pipeline.approve_content(r["content_id"])
+            approved += 1
+
+    await update.message.reply_text(
+        f"✅ Approved {approved} platform(s). "
+        f"(Note: actual posting to each platform's API is not yet connected in V1 — "
+        f"content is marked approved and tracked, ready for that step next.)"
+    )
+
+
+@_owner_only
+async def approve_platform(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    bundle = PENDING_BUNDLES.get(chat_id)
+    if not bundle or not context.args:
+        await update.message.reply_text("Usage: /approve_platform linkedin")
+        return
+
+    platform = context.args[0].lower()
+    match = next((r for r in bundle["platform_results"] if r["platform"] == platform), None)
+    if not match:
+        await update.message.reply_text(f"No content for platform '{platform}' in this bundle.")
+        return
+
+    pipeline.approve_content(match["content_id"])
+    await update.message.reply_text(f"✅ Approved {platform}.")
+
+
+@_owner_only
+async def reject_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    bundle = PENDING_BUNDLES.pop(chat_id, None)
+    if not bundle:
+        await update.message.reply_text("No pending bundle.")
+        return
+    for r in bundle["platform_results"]:
+        pipeline.reject_content(r["content_id"])
+    await update.message.reply_text("❌ Bundle rejected.")
+
+
+def _extract_text(filepath, filename):
+    if filename.lower().endswith(".txt"):
+        with open(filepath, "r", errors="ignore") as f:
+            return f.read()
+    if filename.lower().endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(filepath)
+            return "\n".join(page.extract_text() or "" for page in reader.pages)
+        except Exception as e:
+            logger.error(f"PDF extraction failed: {e}")
+            return ""
+    return ""
+
+
+def build_app():
+    db.init_db()
+    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("generate", generate))
+    app.add_handler(CommandHandler("approve", approve_all))
+    app.add_handler(CommandHandler("approve_platform", approve_platform))
+    app.add_handler(CommandHandler("reject", reject_all))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(handle_tier_choice))
+
+    return app
+
+
+if __name__ == "__main__":
+    if not config.TELEGRAM_BOT_TOKEN:
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN environment variable first.")
+    if not config.GEMINI_API_KEY:
+        raise SystemExit("Set GEMINI_API_KEY environment variable first. Get a free key at https://aistudio.google.com/apikey")
+
+    application = build_app()
+    print("🤖 ICOS Bot starting... send /start to your bot in Telegram.")
+    application.run_polling()
+"""
+ICOS Configuration
+All settings live here so nothing is hard-coded elsewhere.
+"""
+
+import os
+
+# --- Telegram Bot ---
+# Set this as an environment variable before running, e.g.:
+#   export TELEGRAM_BOT_TOKEN="8495034853:AAHUaGcM4oxImNjQzWjQKVNOvGkmCWjiLwY"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+# The Telegram numeric user ID of the ONLY person allowed to control the bot.
+# Leave blank for now — bot.py will print your ID the first time you message it,
+# then paste it here (or set as env var OWNER_TELEGRAM_ID) to lock the bot to you.
+OWNER_TELEGRAM_ID = os.environ.get("OWNER_TELEGRAM_ID", "")
+
+# --- AI Provider: Google Gemini (free tier, no card required) ---
+# Get a free key at: https://aistudio.google.com/apikey
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+AI_MODEL = "gemini-2.0-flash"
+
+# --- Database: Supabase (Postgres) ---
+# Get these from your Supabase project: Project Settings -> API
+#   SUPABASE_URL looks like: https://xxxxxxxxxxxx.supabase.co
+#   SUPABASE_KEY: use the "service_role" secret key (NOT the public "anon" key) —
+#   this bot runs as a trusted backend, not a browser, so it needs the service_role
+#   key to read/write freely without setting up Row Level Security policies.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+
+# --- Products (from locked blueprint) ---
+PRODUCTS = {
+    "WPPS": "Workplace Political System",
+    "HOS": "Household Operating System",
+    "MIZAN": "Mizan",
+    "LTOS": "Life/Lifestyle Operating System",
+    "DOS": "Decision Operating System",
+}
+
+VALID_TIERS = ["Full_OS", "Handbook", "Codex"]
+
+# --- Platforms currently implemented in V1 ---
+# (Instagram not yet designed per blueprint — excluded until format is locked)
+ACTIVE_PLATFORMS = ["linkedin", "blog", "facebook", "pinterest"]
+
+# --- Reply Assistant (separate, dedicated bot — screenshot-based LinkedIn replies) ---
+# This is a SEPARATE bot from the main content bot, on purpose — different Telegram token.
+REPLY_BOT_TOKEN = os.environ.get("REPLY_BOT_TOKEN", "")
+REPLY_BOT_OWNER_ID = os.environ.get("REPLY_BOT_OWNER_ID", "")
+"""
+ICOS Database Layer — Supabase (Postgres) edition
+Implements the locked data model:
+Product -> Knowledge Unit -> CIP -> Platform Content -> Audit -> Publication
+Plus Content Ecosystem Memory (tracks which "angle" a KU has used per platform,
+so the same insight isn't recycled the same way twice).
+
+IMPORTANT FOR NON-TECHNICAL USE: this is the ONLY file that knows the database
+is Supabase. Every other file (pipeline.py, bot.py) calls these functions by
+name, exactly as before — they have no idea what's behind them. If the
+database is ever changed again, only this file needs to change.
+
+NOTE: unlike SQLite, Supabase tables cannot be created from this Python file —
+Supabase's client talks to the database over its REST API (PostgREST), which
+doesn't run table-creation SQL. The tables are created ONCE by pasting
+schema.sql into the Supabase dashboard's SQL Editor. See SETUP_INSTRUCTIONS.md.
+"""
+
+import json
+import uuid
+from datetime import datetime, timezone
+
+from supabase import create_client, Client
+
+import config
+
+_client: Client = None
+
+
+def get_client() -> Client:
+    global _client
+    if _client is None:
+        if not config.SUPABASE_URL or not config.SUPABASE_KEY:
+            raise RuntimeError(
+                "SUPABASE_URL / SUPABASE_KEY not set. Create a free project at "
+                "https://supabase.com, then set these as environment variables. "
+                "See SETUP_INSTRUCTIONS.md."
+            )
+        _client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+    return _client
+
+
+def init_db():
+    """
+    Tables live in Supabase already (created once via schema.sql in the SQL
+    Editor). This just checks the connection actually works, so a missing key
+    or un-run schema fails loudly here instead of silently later mid-pipeline.
+    """
+    try:
+        get_client().table("products").select("product_id").limit(1).execute()
+    except Exception as e:
+        raise RuntimeError(
+            "Could not reach the 'products' table in Supabase. Make sure you've "
+            "run schema.sql in the Supabase SQL Editor first, and that "
+            "SUPABASE_URL / SUPABASE_KEY are correct. Original error: " + str(e)
+        )
+
+
+def new_id(prefix=""):
+    return f"{prefix}{uuid.uuid4().hex[:12]}"
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------- Products ----------
+
+def add_product(product_id, product_name, tier, source_filename):
+    get_client().table("products").insert({
+        "product_id": product_id,
+        "product_name": product_name,
+        "tier": tier,
+        "source_filename": source_filename,
+        "uploaded_at": now(),
+    }).execute()
+
+
+# ---------- Knowledge Units ----------
+
+def add_knowledge_unit(product_id, category, core_insight, raw_source_text):
+    ku_id = new_id("ku_")
+    get_client().table("knowledge_units").insert({
+        "ku_id": ku_id,
+        "product_id": product_id,
+        "category": category,
+        "core_insight": core_insight,
+        "raw_source_text": raw_source_text,
+        "extracted_at": now(),
+    }).execute()
+    return ku_id
+
+
+def get_knowledge_unit(ku_id):
+    res = get_client().table("knowledge_units").select("*").eq("ku_id", ku_id).execute()
+    return res.data[0] if res.data else None
+
+
+def get_unused_knowledge_unit(product_id):
+    """Get a KU from this product that hasn't been published on every active platform yet."""
+    res = (
+        get_client()
+        .table("knowledge_units")
+        .select("*")
+        .eq("product_id", product_id)
+        .neq("status", "exhausted")
+        .order("extracted_at", desc=False)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+# ---------- CIP ----------
+
+def save_cip(ku_id, dimensions: dict):
+    cip_id = new_id("cip_")
+    get_client().table("cip").insert({
+        "cip_id": cip_id,
+        "ku_id": ku_id,
+        "core_insight": dimensions.get("core_insight", ""),
+        "real_life_situation": dimensions.get("real_life_situation", ""),
+        "hidden_issue": dimensions.get("hidden_issue", ""),
+        "psychological_dimension": dimensions.get("psychological_dimension", ""),
+        "behavioral_dimension": dimensions.get("behavioral_dimension", ""),
+        "positive_value": dimensions.get("positive_value", ""),
+        "negative_value": dimensions.get("negative_value", ""),
+        "common_behaviour": dimensions.get("common_behaviour", ""),
+        "alternative_perspective": dimensions.get("alternative_perspective", ""),
+        "practical_insight": dimensions.get("practical_insight", ""),
+        "reflection": dimensions.get("reflection", ""),
+        "curiosity_bridge": dimensions.get("curiosity_bridge", ""),
+        "created_at": now(),
+    }).execute()
+    return cip_id
+
+
+def get_cip(cip_id):
+    res = get_client().table("cip").select("*").eq("cip_id", cip_id).execute()
+    return res.data[0] if res.data else None
+
+
+def get_latest_cip_for_ku(ku_id):
+    """Most recently created CIP for a given Knowledge Unit."""
+    res = (
+        get_client()
+        .table("cip")
+        .select("*")
+        .eq("ku_id", ku_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+# ---------- Ecosystem Memory ----------
+
+def get_used_intents(ku_id, platform):
+    """Which Editorial Intents has this KU already used on this platform?"""
+    res = (
+        get_client()
+        .table("ecosystem_history")
+        .select("editorial_intent")
+        .eq("ku_id", ku_id)
+        .eq("platform", platform)
+        .execute()
+    )
+    return [r["editorial_intent"] for r in res.data]
+
+
+def log_ecosystem_use(ku_id, platform, editorial_intent):
+    get_client().table("ecosystem_history").insert({
+        "id": new_id("eco_"),
+        "ku_id": ku_id,
+        "platform": platform,
+        "editorial_intent": editorial_intent,
+        "used_at": now(),
+    }).execute()
+
+
+# ---------- Generated Content ----------
+
+def save_generated_content(ku_id, cip_id, product_id, platform, editorial_intent, content_text):
+    content_id = new_id("content_")
+    get_client().table("generated_content").insert({
+        "content_id": content_id,
+        "ku_id": ku_id,
+        "cip_id": cip_id,
+        "product_id": product_id,
+        "platform": platform,
+        "editorial_intent": editorial_intent,
+        "content_text": content_text,
+        "generated_at": now(),
+    }).execute()
+    return content_id
+
+
+def update_audit_result(content_id, audit_status, audit_results: dict):
+    get_client().table("generated_content").update({
+        "audit_status": audit_status,
+        "audit_results": audit_results,  # jsonb column — dict stored directly, no json.dumps needed
+    }).eq("content_id", content_id).execute()
+
+
+def update_approval(content_id, approval_status):
+    get_client().table("generated_content").update({
+        "approval_status": approval_status,
+        "approved_at": now(),
+    }).eq("content_id", content_id).execute()
+
+
+def update_publication(content_id, published_url):
+    get_client().table("generated_content").update({
+        "publication_status": "published",
+        "published_url": published_url,
+        "published_at": now(),
+    }).eq("content_id", content_id).execute()
+
+
+def get_content(content_id):
+    res = get_client().table("generated_content").select("*").eq("content_id", content_id).execute()
+    return res.data[0] if res.data else None
+
+
+def get_pending_bundle_for_ku(ku_id):
+    """All platform content generated for one KU that's awaiting approval."""
+    res = (
+        get_client()
+        .table("generated_content")
+        .select("*")
+        .eq("ku_id", ku_id)
+        .eq("approval_status", "pending")
+        .order("platform")
+        .execute()
+    )
+    return res.data
+
+
+# ---------- Status (used by bot.py's /status command) ----------
+
+def get_status_counts():
+    """Returns (product_count, ku_count, published_count) for the /status command."""
+    client = get_client()
+    products = client.table("products").select("product_id", count="exact").execute()
+    kus = client.table("knowledge_units").select("ku_id", count="exact").execute()
+    published = (
+        client.table("generated_content")
+        .select("content_id", count="exact")
+        .eq("publication_status", "published")
+        .execute()
+    )
+    return products.count or 0, kus.count or 0, published.count or 0
+"""
+ICOS Knowledge Extraction Engine
+Implements: PRODUCT -> KNOWLEDGE UNIT -> CANONICAL INSIGHT PACKAGE (CIP)
+per the locked blueprint (Section 8A, Phase 2-6).
+
+Uses Claude to do the actual extraction/reasoning work.
+"""
+
+import json
+import config
+from ai_client import get_client
+
+
+
+EXTRACTION_PROMPT = """You are extracting proprietary knowledge from a product document for INAYA SOLUTIONS.
+
+STRICT RULES:
+- Extract ONLY ideas explicitly present in the text below. Do not add outside knowledge.
+- Each Knowledge Unit must be a single, distinct, valuable idea a reader could learn.
+- Do not include internal tool names, proprietary process names, or anything that would let
+  someone reconstruct the full proprietary system if read publicly later.
+- Identify 3 to 8 distinct Knowledge Units from this text (fewer if the text is short/thin).
+
+For each Knowledge Unit, return:
+- category: a short label (e.g. "Hidden Pattern", "Common Mistake", "Misconception")
+- core_insight: 1-2 sentences, the essential idea
+- source_excerpt: the short piece of original text this came from (for traceability)
+
+Return ONLY valid JSON, an array of objects with keys: category, core_insight, source_excerpt.
+No other text before or after the JSON.
+
+PRODUCT TEXT:
+---
+{text}
+---
+"""
+
+CIP_PROMPT = """You are building a Canonical Insight Package (CIP) from ONE approved Knowledge Unit,
+for INAYA SOLUTIONS. The CIP is the complete intellectual source that all platform content will
+later be adapted from — so be thorough, but do NOT invent anything not reasonably implied by the
+core insight below. Leave a field as an empty string "" if it genuinely doesn't apply.
+
+CORE INSIGHT: {core_insight}
+CATEGORY: {category}
+SOURCE CONTEXT: {source_excerpt}
+
+Return ONLY valid JSON with these exact keys (all strings):
+core_insight, real_life_situation, hidden_issue, psychological_dimension, behavioral_dimension,
+positive_value, negative_value, common_behaviour, alternative_perspective, practical_insight,
+reflection, curiosity_bridge
+
+No other text before or after the JSON.
+"""
+
+
+def extract_knowledge_units(product_text: str) -> list:
+    """Send product text to Claude, get back a list of distinct Knowledge Units."""
+    # Guard against extremely long documents — trim to a safe size for V1
+    text = product_text[:15000]
+
+    response = get_client().messages.create(
+        model=config.AI_MODEL,
+        max_tokens=4000,
+        messages=[{"role": "user", "content": EXTRACTION_PROMPT.format(text=text)}]
+    )
+    raw = response.content[0].text.strip()
+    raw = _strip_code_fences(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+
+def build_cip(core_insight: str, category: str, source_excerpt: str) -> dict:
+    """Send one Knowledge Unit to Claude, get back the full CIP dimension palette."""
+    response = get_client().messages.create(
+        model=config.AI_MODEL,
+        max_tokens=1500,
+        messages=[{"role": "user", "content": CIP_PROMPT.format(
+            core_insight=core_insight, category=category, source_excerpt=source_excerpt
+        )}]
+    )
+    raw = response.content[0].text.strip()
+    raw = _strip_code_fences(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"core_insight": core_insight}
+
+
+def _strip_code_fences(text: str) -> str:
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines)
+    return text.strip()
+"""
+ICOS Audit Engine
+Runs the locked mandatory checks before any content reaches Telegram for approval.
+V1 implements the checks that can be reliably automated with an LLM judge; the full
+12-14 point audits per platform (from the blueprint) are the target for later refinement —
+this is the working core that catches the most important failures now.
+"""
+
+import json
+import config
+from ai_client import get_client
+
+
+AUDIT_PROMPT = """You are auditing content generated for INAYA SOLUTIONS before it can be published.
+Be strict. This is a quality gate, not a formality.
+
+CONTENT TO AUDIT:
+---
+{content}
+---
+
+PRODUCT THIS SHOULD BE ABOUT: {product_name}
+
+Check ALL of the following and answer true/false for each:
+
+1. product_isolation: Does the content stay focused on ONLY {product_name}, with no mention of
+   any other product or confused product identity?
+2. no_proprietary_leak: Does it AVOID revealing a complete protocol, framework, internal matrix,
+   or enough detail that someone could reconstruct the full proprietary system? (It's fine and
+   expected to reveal the insight/problem/perspective — just not the complete system.)
+3. human_quality: Does it read like an intelligent human wrote it — NOT generic AI clichés,
+   corporate buzzwords, "In today's fast-paced world" style openers, or robotic phrasing?
+4. genuine_value: Does it teach something genuinely useful, not just generic/obvious advice or
+   empty motivation?
+5. not_generic_ai: Could this be mistaken for generic AI-generated content with the product name
+   removed? Answer false if it feels intelligent/specific/original, true if it feels generic.
+   (true here is a FAIL condition — flag it as a problem)
+6. appropriate_cta: If there's a product mention/CTA, is it soft and earned rather than
+   pushy/aggressive ("BUY NOW", "Click here now", etc.)?
+
+Return ONLY valid JSON in this exact format, no other text:
+{{
+  "product_isolation": true/false,
+  "no_proprietary_leak": true/false,
+  "human_quality": true/false,
+  "genuine_value": true/false,
+  "not_generic_ai": true/false,
+  "appropriate_cta": true/false,
+  "overall_pass": true/false,
+  "failure_reasons": ["list any specific reasons for failure, empty list if all passed"]
+}}
+"""
+
+
+def run_audit(content_text: str, product_name: str) -> dict:
+    """Returns dict with per-check results, overall_pass, and failure_reasons."""
+    response = get_client().messages.create(
+        model=config.AI_MODEL,
+        max_tokens=800,
+        messages=[{"role": "user", "content": AUDIT_PROMPT.format(
+            content=content_text, product_name=product_name
+        )}]
+    )
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = "\n".join(l for l in raw.split("\n") if not l.strip().startswith("```"))
+
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        # Fail safe: if the audit itself breaks, don't let content through silently
+        result = {
+            "product_isolation": False, "no_proprietary_leak": False,
+            "human_quality": False, "genuine_value": False,
+            "not_generic_ai": False, "appropriate_cta": False,
+            "overall_pass": False,
+            "failure_reasons": ["Audit engine could not parse a result — treated as fail for safety."]
+        }
+
+    # Compute overall_pass ourselves too, don't fully trust the model's own summary field
+    checks = ["product_isolation", "no_proprietary_leak", "human_quality",
+              "genuine_value", "not_generic_ai", "appropriate_cta"]
+    all_pass = all(result.get(k, False) for k in checks)
+    result["overall_pass"] = all_pass
+
+    return result
+"""
+ICOS Pipeline Orchestrator
+Wires together: Extraction -> CIP -> Platform Generation -> Audit -> Bundle ready for Telegram.
+This is the "conductor" — bot.py calls into this, this calls into extraction/generators/audits.
+"""
+
+import config
+import database as db
+import extraction
+import generator_linkedin as linkedin
+import generator_blog as blog
+import generator_facebook as facebook
+import generator_pinterest as pinterest
+
+GENERATORS = {
+    "linkedin": linkedin,
+    "blog": blog,
+    "facebook": facebook,
+    "pinterest": pinterest,
+}
+
+
+def process_new_product(product_id, product_name, tier, source_filename, product_text):
+    """
+    STEP 1: Product uploaded -> extract Knowledge Units -> build CIP for each.
+    Returns the list of new ku_ids created.
+    """
+    db.add_product(product_id, product_name, tier, source_filename)
+
+    raw_units = extraction.extract_knowledge_units(product_text)
+    ku_ids = []
+
+    for unit in raw_units:
+        ku_id = db.add_knowledge_unit(
+            product_id=product_id,
+            category=unit.get("category", ""),
+            core_insight=unit.get("core_insight", ""),
+            raw_source_text=unit.get("source_excerpt", "")
+        )
+        cip_dimensions = extraction.build_cip(
+            core_insight=unit.get("core_insight", ""),
+            category=unit.get("category", ""),
+            source_excerpt=unit.get("source_excerpt", "")
+        )
+        db.save_cip(ku_id, cip_dimensions)
+        ku_ids.append(ku_id)
+
+    return ku_ids
+
+
+def generate_daily_bundle(product_id, product_name):
+    """
+    STEP 2: Pick next unused Knowledge Unit for this product, generate content
+    for every active platform, run audits, save results.
+    Returns a summary dict ready to format for Telegram.
+    """
+    ku = db.get_unused_knowledge_unit(product_id)
+    if not ku:
+        return None
+
+    cip = _get_latest_cip_for_ku(ku["ku_id"])
+    if not cip:
+        return None
+
+    results = []
+    for platform in config.ACTIVE_PLATFORMS:
+        generator = GENERATORS[platform]
+
+        avoid_intents = db.get_used_intents(ku["ku_id"], platform)
+        content_text = generator.generate(cip, product_name, avoid_intents=avoid_intents)
+
+        content_id = db.save_generated_content(
+            ku_id=ku["ku_id"], cip_id=cip["cip_id"], product_id=product_id,
+            platform=platform, editorial_intent="", content_text=content_text
+        )
+
+        audit_result = audits_run(content_text, product_name)
+        audit_status = "PASS" if audit_result["overall_pass"] else "FAIL"
+        db.update_audit_result(content_id, audit_status, audit_result)
+
+        results.append({
+            "content_id": content_id,
+            "platform": platform,
+            "content_text": content_text,
+            "audit_status": audit_status,
+            "audit_result": audit_result,
+        })
+
+    return {
+        "ku_id": ku["ku_id"],
+        "ku_core_insight": ku["core_insight"],
+        "product_id": product_id,
+        "product_name": product_name,
+        "platform_results": results,
+    }
+
+
+def approve_content(content_id):
+    db.update_approval(content_id, "approved")
+    content = db.get_content(content_id)
+    db.log_ecosystem_use(content["ku_id"], content["platform"], content.get("editorial_intent") or "general")
+
+
+def reject_content(content_id):
+    db.update_approval(content_id, "rejected")
+
+
+def _get_latest_cip_for_ku(ku_id):
+    return db.get_latest_cip_for_ku(ku_id)
+
+
+# Local import alias to avoid circular import at module load time
+from audits import run_audit as audits_run
+"""
+LinkedIn Generator
+Implements LINKEDIN MASTER FORMAT v1.0 (blueprint Section 10A) exactly as locked.
+13-stage editorial architecture, NOT visible as 13 headings — must read as natural editorial writing.
+"""
+
+import config
+from ai_client import get_client
+
+
+PROMPT_TEMPLATE = """You are writing a LinkedIn post for INAYA SOLUTIONS, for the product "{product_name}".
+
+You must follow the LOCKED LinkedIn Master Format exactly. This is the underlying editorial
+architecture (NOT visible as headings — it must read as one natural, flowing piece):
+
+1. Recognition-first opening — start inside a real professional problem. Never "Today I want to discuss..."
+2. Situation Mirror — concrete, recognizable workplace situation
+3. Hidden Problem — what people think is happening vs what's actually happening
+4. Why It Happens — relevant psychology/behavior dimension from the CIP below (only if genuinely useful)
+5. Reframe — move reader from "I thought it was X" to "maybe the deeper issue is Y"
+6. Core Insight — ONE strong central idea, not a list of tips
+7. Practical Value — something the reader can notice/apply, WITHOUT revealing the complete system
+8. Consequence/What-If — realistic, not fear-mongering
+9. Memorable Close — a clear, earned observation
+10. Reflection/Conversation — end with a genuine question, NOT "Thoughts?" or "Agree?"
+11. Product Curiosity Bridge — natural progression toward "there's a deeper system for this"
+12. Soft Product CTA — mention ONLY {product_name}, low-pressure, relevant to the problem discussed
+13. Editorial angle — choose the strongest of: situation-led, contradiction-led, consequence-led,
+    observation-led, question-led, behaviour-led, hidden-mechanism-led, or perspective-led
+
+VOICE: Professional, human, calm, practical, evidence-aware, minimal, operational.
+
+HARD RULES — NEVER:
+- Generic motivational content, AI clichés, corporate buzzwords
+- "In today's fast-paced world..." or similar openers
+- Generic "5 tips" format
+- Reveal complete protocols, frameworks, or proprietary mechanisms — only the insight
+- Excessive emojis or engagement bait ("Thoughts? Agree? Comment below!")
+
+LENGTH: 750-900 characters.
+
+Avoid repeating this editorial intent if already used for this Knowledge Unit on LinkedIn: {avoid_intents}
+
+CANONICAL INSIGHT PACKAGE (your source material — use only what's relevant, don't force every field):
+Core Insight: {core_insight}
+Real-life Situation: {real_life_situation}
+Hidden Issue: {hidden_issue}
+Psychological Dimension: {psychological_dimension}
+Behavioral Dimension: {behavioral_dimension}
+Common Behaviour: {common_behaviour}
+Alternative Perspective: {alternative_perspective}
+Practical Insight: {practical_insight}
+Reflection: {reflection}
+Curiosity Bridge: {curiosity_bridge}
+
+Write the LinkedIn post now. Output ONLY the post text, nothing else — no preamble, no explanation.
+"""
+
+
+def generate(cip: dict, product_name: str, avoid_intents: list = None) -> str:
+    avoid_intents = avoid_intents or []
+    prompt = PROMPT_TEMPLATE.format(
+        product_name=product_name,
+        avoid_intents=", ".join(avoid_intents) if avoid_intents else "none yet",
+        core_insight=cip.get("core_insight", ""),
+        real_life_situation=cip.get("real_life_situation", ""),
+        hidden_issue=cip.get("hidden_issue", ""),
+        psychological_dimension=cip.get("psychological_dimension", ""),
+        behavioral_dimension=cip.get("behavioral_dimension", ""),
+        common_behaviour=cip.get("common_behaviour", ""),
+        alternative_perspective=cip.get("alternative_perspective", ""),
+        practical_insight=cip.get("practical_insight", ""),
+        reflection=cip.get("reflection", ""),
+        curiosity_bridge=cip.get("curiosity_bridge", ""),
+    )
+    response = get_client().messages.create(
+        model=config.AI_MODEL,
+        max_tokens=1000,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.content[0].text.strip()
+"""
+Blog Generator
+Implements the LOCKED Blog 10-Stage Architecture (blueprint Section 10, referenced throughout).
+Hook -> Real-Life Recognition -> Hidden Problem -> Why -> Consequence -> Different Perspective
+-> Practical Insight -> Reflection -> Product Curiosity Bridge -> Soft CTA
+"""
+
+import config
+from ai_client import get_client
+
+
+PROMPT_TEMPLATE = """You are writing a Blog article for INAYA SOLUTIONS, for the product "{product_name}".
+
+Follow the LOCKED Blog 10-Stage Architecture exactly. This is the underlying editorial
+architecture — do NOT create 10 visible headings. It must read as one intelligently
+constructed article, not a checklist.
+
+01 Hook — specific tension, observation, contradiction, or question. No generic openings.
+02 Real-Life Recognition — show behavior/situations readers genuinely recognize
+03 Hidden Problem — move beneath the visible problem to what's actually happening
+04 Why It Happens — relevant psychological/behavioral/decision dimensions, only where genuinely useful
+05 Consequence — realistic consequences or what-if/what-if-not outcomes
+06 Different Perspective — a meaningful perspective shift
+07 Practical Insight — useful standalone value WITHOUT revealing the complete proprietary system
+08 Reflection — return to the original situation with new understanding
+09 Product Curiosity Bridge — move from "understanding the problem" to "managing it systematically"
+10 Soft CTA — mention ONLY {product_name}, product link at the bottom, feels earned not pushy
+
+VOICE: Human, intelligent, specific, deep, relatable, useful, calm, observational, trustworthy.
+NEVER: generic SEO filler, AI clichés, corporate thought-leadership, keyword stuffing,
+advertisement disguised as an article.
+
+LENGTH: 800-1200 words.
+
+Avoid repeating this editorial intent if already used for this Knowledge Unit on Blog: {avoid_intents}
+
+CANONICAL INSIGHT PACKAGE (source material — use what's relevant, don't force every field):
+Core Insight: {core_insight}
+Real-life Situation: {real_life_situation}
+Hidden Issue: {hidden_issue}
+Psychological Dimension: {psychological_dimension}
+Behavioral Dimension: {behavioral_dimension}
+Positive Value: {positive_value}
+Negative Value: {negative_value}
+Common Behaviour: {common_behaviour}
+Alternative Perspective: {alternative_perspective}
+Practical Insight: {practical_insight}
+Reflection: {reflection}
+Curiosity Bridge: {curiosity_bridge}
+
+Write the full blog article now, including a headline at the top. Output ONLY the article, nothing else.
+"""
+
+
+def generate(cip: dict, product_name: str, avoid_intents: list = None) -> str:
+    avoid_intents = avoid_intents or []
+    prompt = PROMPT_TEMPLATE.format(
+        product_name=product_name,
+        avoid_intents=", ".join(avoid_intents) if avoid_intents else "none yet",
+        core_insight=cip.get("core_insight", ""),
+        real_life_situation=cip.get("real_life_situation", ""),
+        hidden_issue=cip.get("hidden_issue", ""),
+        psychological_dimension=cip.get("psychological_dimension", ""),
+        behavioral_dimension=cip.get("behavioral_dimension", ""),
+        positive_value=cip.get("positive_value", ""),
+        negative_value=cip.get("negative_value", ""),
+        common_behaviour=cip.get("common_behaviour", ""),
+        alternative_perspective=cip.get("alternative_perspective", ""),
+        practical_insight=cip.get("practical_insight", ""),
+        reflection=cip.get("reflection", ""),
+        curiosity_bridge=cip.get("curiosity_bridge", ""),
+    )
+    response = get_client().messages.create(
+        model=config.AI_MODEL,
+        max_tokens=2500,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.content[0].text.strip()
+"""
+Facebook Generator
+Implements the LOCKED Facebook Master Format v1.0 (blueprint Section 10G).
+Selects ONE of 4 structures based on the Knowledge Unit's nature.
+"""
+
+import config
+from ai_client import get_client
+
+
+PROMPT_TEMPLATE = """You are writing a Facebook post for INAYA SOLUTIONS, for the product "{product_name}".
+
+Choose the ONE strongest of these 4 locked structures for this Knowledge Unit, then write it:
+
+STRUCTURE A (Recognition-Led): Real situation people recognize -> validation + deeper understanding
+  -> reflection -> engagement question inviting shared experience
+STRUCTURE B (Observation-Led): Specific human behavior observed -> why + consequence -> perspective
+  -> engagement question asking their experience
+STRUCTURE C (Problem-Solution-Bridge): Real problem -> why it happens (not fully solved) -> hint at
+  deeper approach -> engagement question
+STRUCTURE D (Question-Led): Genuine question -> explore + deeper layers -> insight -> invite their answer
+
+RULES:
+- Warm, conversational tone — like talking to a friend, not a company
+- Short paragraphs (2-3 sentences max)
+- Simple, jargon-free language
+- 200-500 words
+- End with ONE genuine engagement question (NOT "Like if you agree" or "Tag someone" — must invite
+  real thoughtful response)
+- NEVER: corporate language, hard selling, multiple tips/lists, fake personal stories
+
+Avoid repeating this editorial intent if already used for this Knowledge Unit on Facebook: {avoid_intents}
+
+CANONICAL INSIGHT PACKAGE (source material):
+Core Insight: {core_insight}
+Real-life Situation: {real_life_situation}
+Psychological Dimension: {psychological_dimension}
+Behavioral Dimension: {behavioral_dimension}
+Common Behaviour: {common_behaviour}
+Alternative Perspective: {alternative_perspective}
+Practical Insight: {practical_insight}
+
+Write the Facebook post now. Output ONLY the post text, nothing else.
+"""
+
+
+def generate(cip: dict, product_name: str, avoid_intents: list = None) -> str:
+    avoid_intents = avoid_intents or []
+    prompt = PROMPT_TEMPLATE.format(
+        product_name=product_name,
+        avoid_intents=", ".join(avoid_intents) if avoid_intents else "none yet",
+        core_insight=cip.get("core_insight", ""),
+        real_life_situation=cip.get("real_life_situation", ""),
+        psychological_dimension=cip.get("psychological_dimension", ""),
+        behavioral_dimension=cip.get("behavioral_dimension", ""),
+        common_behaviour=cip.get("common_behaviour", ""),
+        alternative_perspective=cip.get("alternative_perspective", ""),
+        practical_insight=cip.get("practical_insight", ""),
+    )
+    response = get_client().messages.create(
+        model=config.AI_MODEL,
+        max_tokens=1000,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.content[0].text.strip()
+"""
+Pinterest Generator
+Implements the LOCKED Pinterest Master Format v1.0 (blueprint Section 10E).
+Selects ONE of 4 structures. Outputs title + description (visual design handled separately/later).
+"""
+
+import config
+from ai_client import get_client
+
+
+PROMPT_TEMPLATE = """You are writing a Pinterest Pin (title + description) for INAYA SOLUTIONS,
+for the product "{product_name}".
+
+Choose the ONE strongest of these 4 locked structures for this Knowledge Unit:
+
+STRUCTURE A (Problem-Led): Real, searchable problem statement as headline -> why it matters + soft benefit
+STRUCTURE B (Insight-Led): Surprising insight/perspective shift as headline -> principle + application
+STRUCTURE C (Practical-Outcome): Benefit/outcome statement as headline -> how to achieve it
+STRUCTURE D (Observation-Led): Relatable observation as headline -> why this happens + understanding
+
+RULES:
+- Headline: 25-35 characters, searchable (real terms people would search), not clickbait
+- Description: 150-200 characters, benefit-focused, natural (NOT keyword-stuffed)
+- Include 3-5 natural search keywords woven into the description
+- Evergreen — must stay relevant for months/years, no time-sensitive language
+- NEVER: generic motivational quotes, direct product promotion, keyword stuffing
+
+Avoid repeating this editorial intent if already used for this Knowledge Unit on Pinterest: {avoid_intents}
+
+CANONICAL INSIGHT PACKAGE (source material):
+Core Insight: {core_insight}
+Real-life Situation: {real_life_situation}
+Positive Value: {positive_value}
+Alternative Perspective: {alternative_perspective}
+Practical Insight: {practical_insight}
+
+Output in exactly this format:
+HEADLINE: [headline text]
+DESCRIPTION: [description text]
+"""
+
+
+def generate(cip: dict, product_name: str, avoid_intents: list = None) -> str:
+    avoid_intents = avoid_intents or []
+    prompt = PROMPT_TEMPLATE.format(
+        product_name=product_name,
+        avoid_intents=", ".join(avoid_intents) if avoid_intents else "none yet",
+        core_insight=cip.get("core_insight", ""),
+        real_life_situation=cip.get("real_life_situation", ""),
+        positive_value=cip.get("positive_value", ""),
+        alternative_perspective=cip.get("alternative_perspective", ""),
+        practical_insight=cip.get("practical_insight", ""),
+    )
+    response = get_client().messages.create(
+        model=config.AI_MODEL,
+        max_tokens=500,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.content[0].text.strip()
+"""
+AI Client — Compatibility Layer
+================================
+This is the ONLY file that knows which AI provider (Gemini, Claude, etc.) is
+actually being used. Every other file in the system (extraction.py, audits.py,
+generators/*.py) calls get_client().messages.create(...) exactly like before —
+they have NO idea Gemini is behind it.
+
+WHY THIS MATTERS FOR YOU (non-technical, don't want to change things often):
+If you ever switch AI providers again in the future, ONLY this one file needs
+to be edited. Nothing else in the system changes.
+
+Currently wired to: Google Gemini (free tier, no card required).
+
+UPDATED: Google replaced the old google-generativeai library with a new one
+called google-genai, and switched to a new API key format ("Auth keys",
+starting with AQ.) that replaces the older AIza... keys. This file now uses
+the current library so newly-created Gemini keys work correctly.
+"""
+
+from google import genai
+from google.genai import types
+
+import config
+
+_client = None
+
+
+class _ContentBlock:
+    """Mimics Anthropic's response.content[0] shape so old code keeps working."""
+    def __init__(self, text):
+        self.text = text
+
+
+class _Response:
+    """Mimics Anthropic's response shape: response.content[0].text"""
+    def __init__(self, text):
+        self.content = [_ContentBlock(text)]
+
+
+class _Messages:
+    def __init__(self, client, model_name):
+        self._client = client
+        self._model_name = model_name
+
+    def create(self, model=None, max_tokens=None, messages=None, **kwargs):
+        """Mimics Anthropic's client.messages.create(...) signature and return shape."""
+        prompt = messages[0]["content"]
+        gen_config = None
+        if max_tokens:
+            gen_config = types.GenerateContentConfig(max_output_tokens=max_tokens)
+
+        response = self._client.models.generate_content(
+            model=self._model_name,
+            contents=prompt,
+            config=gen_config,
+        )
+
+        try:
+            text = response.text
+        except Exception:
+            # Gemini sometimes returns no text if it hit a safety filter etc.
+            text = ""
+
+        return _Response(text)
+
+
+class GeminiCompatClient:
+    """Drop-in replacement for anthropic.Anthropic() — same .messages.create() interface."""
+    def __init__(self, api_key, model_name):
+        underlying_client = genai.Client(api_key=api_key)
+        self.messages = _Messages(underlying_client, model_name)
+
+
+def get_client():
+    global _client
+    if _client is None:
+        if not config.GEMINI_API_KEY:
+            raise RuntimeError(
+                "GEMINI_API_KEY is not set. Get a free key at "
+                "https://aistudio.google.com/apikey and set it as an environment variable."
+            )
+        _client = GeminiCompatClient(config.GEMINI_API_KEY, config.AI_MODEL)
+    return _client
+
+
+# ---------------------------------------------------------------------------
+# ADDITIVE CAPABILITY — image reading (for the Reply Assistant module).
+# This does NOT touch the Messages-mimicking interface above, which the main
+# content bot (extraction/audits/generators) relies on. Kept fully separate
+# so nothing already working can break.
+# ---------------------------------------------------------------------------
+
+def generate_with_image(prompt: str, image_bytes: bytes, mime_type: str = "image/png") -> str:
+    """
+    Send a prompt + an image (e.g. a LinkedIn screenshot) to Gemini and get text back.
+    Used only by the Reply Assistant module — the main content bot never calls this.
+    """
+    if not config.GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set.")
+
+    client = genai.Client(api_key=config.GEMINI_API_KEY)
+    image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+    response = client.models.generate_content(
+        model=config.AI_MODEL,
+        contents=[prompt, image_part],
+    )
+
+    try:
+        return response.text.strip()
+    except Exception:
+        return ""

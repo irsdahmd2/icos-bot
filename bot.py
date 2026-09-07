@@ -112,7 +112,7 @@ async def handle_menu_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if choice == "upload":
         await context.bot.send_message(
             chat_id=query.message.chat_id,
-            text="📄 Send me the product PDF now — I'll ask for the product name and tier next."
+            text="📤 Please upload your product PDF now."
         )
     elif choice == "generate":
         await _send_generate_options(query.message.chat_id, context)
@@ -144,10 +144,15 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("No products uploaded yet.")
         return
-    lines = ["#  | Product | Full OS | Handbook | Codex"]
+    lines = ["📊 Dashboard\n"]
     for i, r in enumerate(rows, 1):
-        lines.append(f"{i}. {r['product_name']} | {r['Full_OS']} | {r['Handbook']} | {r['Codex']}")
-    await update.message.reply_text("\n".join(lines))
+        lines.append(
+            f"{i}. {r['product_name']}\n"
+            f"   📚 KUs — Full OS: {r['Full_OS']} | Handbook: {r['Handbook']} | Codex: {r['Codex']}\n"
+            f"   ✍️ Posts generated: {r['posts_generated']} | ✅ Audit passed: {r['audit_passed']} "
+            f"| 📤 Confirmed published: {r['confirmed_published']}"
+        )
+    await update.message.reply_text("\n\n".join(lines))
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -169,7 +174,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     _pending_uploads[chat_id] = {"raw_text": raw_text, "filename": doc.file_name}
     await update.message.reply_text(
-        "📄 Got it. What's the PRODUCT NAME? (type it as plain text, e.g. Household Operating System)"
+        "📄 Got it — please confirm, what product is this? (type the name as plain text, e.g. Household Operating System)"
     )
 
 
@@ -192,7 +197,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("Codex (6-10p)", callback_data=f"tier|{chat_id}|Codex"),
     ]]
     await update.message.reply_text(
-        f"✅ Product: {product_name}\nWhich tier is this document?",
+        f"✅ Confirmed: {product_name}\nWhich tier is this document?",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -207,7 +212,11 @@ async def handle_tier_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("⚠️ Upload expired — please send the PDF again.")
         return
 
-    await query.edit_message_text(f"⏳ Extracting Knowledge Units ({tier})... this can take a minute.")
+    await query.edit_message_text(
+        f"⏳ Please wait — extracting Knowledge Units ({tier}). This only builds the raw "
+        f"knowledge base; actual posts per platform are created next, on demand, when you "
+        f"tap Generate Today's Post."
+    )
     result = await asyncio.to_thread(
         pipeline.process_new_product,
         product_name=pending["product_name"], tier=tier,
@@ -217,10 +226,14 @@ async def handle_tier_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=(f"✅ Done.\nProduct: {result['product_name']} ({result['product_id']})\n"
-              f"Tier: {result['tier']}\nKnowledge Units extracted: {result['ku_count']}\n\n"
-              f"Send /generate any time to create the next post.")
+        text=(f"✅ Extraction complete.\n\n"
+              f"Product: {result['product_name']} ({result['product_id']})\n"
+              f"Tier: {result['tier']}\n"
+              f"📚 Knowledge Units extracted: {result['ku_count']}\n\n"
+              f"No posts have been generated yet — that happens next, per platform, "
+              f"whenever you tap Generate Today's Post.")
     )
+    await send_welcome(chat_id, context)
 
 
 PLATFORM_LABELS = {
