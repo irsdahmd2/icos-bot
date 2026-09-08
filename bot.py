@@ -358,22 +358,20 @@ async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _format_delivery(result: dict) -> str:
-    status_emoji = "✅" if result["audit_status"] == "PASS" else "❌"
-    fails = [k for k, v in result["audit_results"].items() if v.get("result") == "FAIL"]
-    fail_note = f"\n⚠️ Failed: {', '.join(fails)}" if fails else ""
+    attempts_note = f" (took {result['attempts']} attempts)" if result.get("attempts", 1) > 1 else ""
     return (
-        f"{status_emoji} Audit: {result['audit_status']}{fail_note}\n"
+        f"✅ Ready to publish{attempts_note}\n"
         f"Post ID: {result['post_code']} | Angle: {result['editorial_intent']}\n\n"
         f"{result['content_text']}"
     )
 
 
-def _action_keyboard(content_id: str, can_publish: bool) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("🔁 Refine", callback_data=f"refine|{content_id}")]]
-    if can_publish:
-        rows.append([InlineKeyboardButton("📤 Ready to Publish", callback_data=f"ready|{content_id}")])
-    rows.append([InlineKeyboardButton("✅ Confirm Published", callback_data=f"confirm|{content_id}")])
-    return InlineKeyboardMarkup(rows)
+def _action_keyboard(content_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Refine", callback_data=f"refine|{content_id}")],
+        [InlineKeyboardButton("📤 Ready to Publish", callback_data=f"ready|{content_id}")],
+        [InlineKeyboardButton("✅ Confirm Published", callback_data=f"confirm|{content_id}")],
+    ])
 
 
 async def handle_platform_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -391,11 +389,10 @@ async def handle_platform_choice(update: Update, context: ContextTypes.DEFAULT_T
         await context.bot.send_message(chat_id=query.message.chat_id, text=f"⚠️ {result['error']}")
         return
 
-    can_publish = result["audit_status"] == "PASS"
     await _send_with_retry(
         context, query.message.chat_id,
         text=_format_delivery(result),
-        reply_markup=_action_keyboard(result["content_id"], can_publish),
+        reply_markup=_action_keyboard(result["content_id"]),
     )
     db.update_content_status(result["content_id"], "telegram_delivered")
     await refresh_pinned_dashboard(query.message.chat_id, context)
@@ -415,11 +412,10 @@ async def handle_refine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=query.message.chat_id, text=f"⚠️ {result['error']}")
         return
 
-    can_publish = result["audit_status"] == "PASS"
     await _send_with_retry(
         context, query.message.chat_id,
         text=_format_delivery(result),
-        reply_markup=_action_keyboard(result["content_id"], can_publish),
+        reply_markup=_action_keyboard(result["content_id"]),
     )
     db.update_content_status(result["content_id"], "telegram_delivered")
     await refresh_pinned_dashboard(query.message.chat_id, context)
@@ -456,11 +452,13 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     tb = "".join(traceback.format_exception(None, context.error, context.error.__traceback__))
     logger.error(tb)
     if isinstance(update, Update) and update.effective_chat:
+        error_name = type(context.error).__name__
+        if error_name in ("NetworkError", "TimedOut"):
+            text = "📶 Connection hiccup — nothing broke. Just try that same action again."
+        else:
+            text = f"⚠️ Something broke: {context.error}\n\n(Full trace in Termux logs.)"
         try:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"⚠️ Something broke: {context.error}\n\n(Full trace in Termux logs.)"
-            )
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
         except Exception:
             pass
 

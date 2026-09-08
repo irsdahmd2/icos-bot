@@ -172,6 +172,14 @@ def mark_kus_used(ku_ids: list):
         get_client().table("knowledge_units").update({"status": "used"}).eq("ku_id", ku_id).execute()
 
 
+def mark_kus_exhausted(ku_ids: list):
+    """A KU that failed audit MAX_AUDIT_RETRIES times in a row — mark it so
+    future generation runs skip it instead of retrying the same weak
+    material forever. Distinct from 'used' so it's traceable later."""
+    for ku_id in ku_ids:
+        get_client().table("knowledge_units").update({"status": "exhausted"}).eq("ku_id", ku_id).execute()
+
+
 # ---------- CIP ----------
 
 def save_cip(ku_id, dimensions: dict):

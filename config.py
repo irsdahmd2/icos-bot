@@ -56,6 +56,12 @@ ACTIVE_PLATFORMS = ["linkedin"]
 # alone is too thin (locked decision, 2026-09-05): combine up to this many.
 MAX_KU_COMBINE = 5
 
+# Locked rule: failed content NEVER reaches Telegram. If a generated post
+# fails audit, the pipeline retries internally (different angle each time)
+# up to this many attempts before giving up and telling the user honestly
+# that this Knowledge Unit needs attention, instead of showing a failed post.
+MAX_AUDIT_RETRIES = 3
+
 # The FULL planned platform list (locked spec), shown for progress context in
 # Telegram even though most of these don't have a working generator yet.
 # ACTIVE_PLATFORMS above is the REAL list the bot can actually generate for.
