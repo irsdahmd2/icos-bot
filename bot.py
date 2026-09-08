@@ -11,6 +11,7 @@ CHANGED 2026-09-05 (final locked model):
 """
 
 import asyncio
+import os
 import logging
 import traceback
 
@@ -470,7 +471,35 @@ def _extract_pdf_text(pdf_bytes: bytes) -> str:
     return "\n".join(page.extract_text() or "" for page in reader.pages)
 
 
+def _start_keepalive_server_if_needed():
+    """Render (and similar free-tier hosts) require the app to answer HTTP
+    requests on the port they assign, or they consider it dead. This has NO
+    effect on Termux — it only activates when a PORT environment variable is
+    present, which Termux never sets. Runs in a background thread so it
+    doesn't interfere with the bot's own polling loop at all."""
+    port = os.environ.get("PORT")
+    if not port:
+        return
+    import http.server
+    import threading
+
+    class _Health(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ICOS bot is running.")
+
+        def log_message(self, *args):
+            pass  # keep Render's logs from filling up with ping noise
+
+    server = http.server.HTTPServer(("0.0.0.0", int(port)), _Health)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info(f"Keep-alive server listening on port {port} (Render/cloud mode).")
+
+
 def main():
+    _start_keepalive_server_if_needed()
     db.init_db()
     app = (
         Application.builder()
