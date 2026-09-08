@@ -1,11 +1,20 @@
 """
-LinkedIn Generator — LinkedIn Master Format v1.0 (13-stage editorial architecture).
+LinkedIn Generator — LinkedIn Master Format v1.0 (LOCKED, per Irshad's spec document).
 
-CHANGED 2026-09-05:
-- The AI now self-reports which of the 8 editorial angles it chose, on a
-  parseable first line. This fixes the bug where editorial_intent was always
-  saved as "" and the anti-repetition rule silently did nothing.
-- Added the explicit universal Humanisation Rule as its own instruction.
+CORE PRINCIPLE (locked):
+ONE KNOWLEDGE UNIT -> CIP -> MASTER EDITORIAL CORE -> LINKEDIN-NATIVE
+TRANSFORMATION -> LINKEDIN AUDIT -> MASTER PRODUCT AUDIT -> APPROVAL -> PUBLICATION
+
+CHANGED 2026-09-08:
+- Rewritten against Irshad's actual locked LinkedIn Master Format v1.0 document
+  (13-stage editorial flow + full anti-pattern list + explicit Product
+  Protection may/must-not + Information Density + Voice, verbatim from spec).
+- Structure changed from a fixed 750-900 character range to a LINE-based
+  structure (locked 2026-09-08): 6-9 short, dense lines/paragraphs following
+  Hook -> Body -> Curiosity bridge -> Product, ending with relevant hashtags.
+- Takes recent_posts (this product's last few PASSING LinkedIn posts) so the
+  model actively avoids repeating a situation/insight it already used —
+  proactive novelty, not just after-the-fact audit rejection.
 """
 
 import config
@@ -18,42 +27,98 @@ ANGLES = [
 
 PROMPT_TEMPLATE = """You are writing a LinkedIn post for INAYA SOLUTIONS, for the product "{product_name}".
 
-You must follow the LOCKED LinkedIn Master Format exactly. This is the underlying editorial
-architecture (NOT visible as headings — it must read as one natural, flowing piece):
+This is the LOCKED LinkedIn Master Format v1.0. Follow this exact editorial architecture as the
+underlying structure of the post — it must NOT appear as visible numbered headings, it must read
+as one natural, flowing piece of writing:
 
-1. Recognition-first opening — start inside a real professional problem. Never "Today I want to discuss..."
-2. Situation Mirror — concrete, recognizable workplace situation
-3. Hidden Problem — what people think is happening vs what's actually happening
-4. Why It Happens — relevant psychology/behavior dimension from the CIP below (only if genuinely useful)
-5. Reframe — move reader from "I thought it was X" to "maybe the deeper issue is Y"
-6. Core Insight — ONE strong central idea, not a list of tips
-7. Practical Value — something the reader can notice/apply, WITHOUT revealing the complete system
-8. Consequence/What-If — realistic, not fear-mongering
-9. Memorable Close — a clear, earned observation
-10. Reflection/Conversation — end with a genuine question, NOT "Thoughts?" or "Agree?"
-11. Product Curiosity Bridge — natural progression toward "there's a deeper system for this".
-    If no product link is available, create general awareness of Inaya Solutions instead.
-12. Soft Product CTA — mention ONLY {product_name}, low-pressure, relevant to the problem discussed
-13. Editorial angle — choose the STRONGEST one for this specific insight from this exact list:
+REAL PROFESSIONAL PROBLEM -> SCROLL-STOPPING RECOGNITION -> SITUATION MIRROR -> HIDDEN TENSION ->
+WHY IT HAPPENS -> REFRAME -> CORE INSIGHT -> PRACTICAL APPLICATION -> CONSEQUENCE/WHAT-IF ->
+MEMORABLE CLOSE -> REFLECTION/CONVERSATION -> PRODUCT CURIOSITY BRIDGE -> SOFT PRODUCT CTA
+
+1. RECOGNITION-FIRST OPENING — start inside a real professional problem. Entry angles: pain
+   recognition, contradiction, unexpected observation, professional question, specific situation,
+   consequence, behaviour, hidden mechanism, perspective. The opening must make the reader think
+   "that happens" / "I've seen this" / "I've done this" / "that's an interesting problem."
+   NEVER: "Today I want to discuss...", generic motivation, generic company intro, artificial
+   controversy, "In today's fast-paced world...", obvious AI-style hooks.
+
+2. SITUATION MIRROR — a concrete, recognisable workplace situation. Specific behaviour, realistic
+   tension, everyday professional circumstances, human reactions, believable consequences. Avoid
+   abstract explanation before the reader understands the situation.
+
+3. HIDDEN PROBLEM — reveal what lies beneath the visible problem. Transition explicitly from
+   WHAT PEOPLE THINK IS HAPPENING to WHAT MAY ACTUALLY BE HAPPENING.
+
+4. WHY IT HAPPENS — use only relevant CIP dimensions (psychology, human behaviour, decision
+   science, communication, organisational behaviour, operational thinking). Never add research
+   merely to sound authoritative. Never invent facts, statistics, studies, or proprietary knowledge.
+
+5. REFRAME — an intellectual turning point: "I thought the problem was X" -> "maybe the deeper
+   issue is Y." (visible->hidden, behaviour->consequence, symptom->cause, assumption->alternative,
+   immediate->long-term, individual->systemic).
+
+6. CORE INSIGHT — ONE strong central insight, not a collection of generic tips. The reader must be
+   able to answer "what did I actually learn?" with one clear answer.
+
+7. PRACTICAL VALUE — something the reader can notice/question/test/recognise/apply. Genuine
+   standalone value. Stop before revealing the complete proprietary product solution.
+
+8. CONSEQUENCE/WHAT-IF — if ignored, what may gradually happen; if recognised, what could change.
+   Never fear-monger, exaggerate, or make unsupported promises.
+
+9. MEMORABLE CLOSE — a clear professional observation that compresses the central insight. Human
+   and earned. No manufactured motivational quotes.
+
+10. REFLECTION/CONVERSATION — end with a genuine question connected to the issue, giving the
+    reader something meaningful to consider. NEVER "Agree?" / "Thoughts?" / "Comment below!"
+
+11. PRODUCT CURIOSITY BRIDGE — natural progression: PROBLEM -> UNDERSTANDING -> DEEPER STRUCTURED
+    SOLUTION EXISTS -> PRODUCT CURIOSITY. Never abruptly switch from insight to advertising. The
+    reader should naturally think "if this problem can be understood this deeply, I wonder what
+    the complete product contains."
+
+12. SOFT PRODUCT CTA — mention ONLY "{product_name}", relevant to the problem discussed, explain
+    why the reader may want to explore it, low-pressure, never dominates the post. Never mention
+    any other product.
+
+13. EDITORIAL ANGLE — choose the STRONGEST angle for this specific insight from exactly this list:
     {angles}
+    Do not reuse the same opening/narrative pattern repeatedly.
 
-HUMANISATION RULE (overrides all other style guidance): this must read as if a real, thoughtful
-professional wrote it — natural, empathetic, intelligent rhythm. No robotic phrasing, no clichés,
-no filler, no formulaic structure. If it could pass for generic AI content with the product name
-removed, it has failed.
+INFORMATION DENSITY (locked): dense in meaning, light in reading effort. Short paragraphs,
+whitespace, clear progression, simple language, deliberate emphasis, bullets only when genuinely
+useful. Do not optimize merely for shortness — optimize for meaningful reading.
 
-VOICE: Professional, human, calm, practical, evidence-aware, minimal, operational.
+STRUCTURE (locked 2026-09-08, overrides any earlier character-count rule): write the post as
+6 to 9 short, dense lines/paragraphs (each line a distinct beat — hook, situation, insight, value,
+close/curiosity as appropriate), structured overall as: HOOK -> BODY -> CURIOSITY BRIDGE TOWARD
+{product_name} -> then end with 3-5 relevant hashtags on their own final line (e.g.
+#Leadership #WorkplaceCulture #{product_name_tag}).
 
-HARD RULES — NEVER:
-- Generic motivational content, AI clichés, corporate buzzwords
-- "In today's fast-paced world..." or similar openers
-- Generic "5 tips" format
-- Reveal complete protocols, frameworks, or proprietary mechanisms — only the insight
-- Excessive emojis or engagement bait ("Thoughts? Agree? Comment below!")
+VOICE (locked): Professional, Human, Calm, Practical, Evidence-aware, Intellectually useful,
+Minimal, Operational. It should feel like an experienced person explaining an important
+professional reality — not a company trying to sell something.
 
-LENGTH: 750-900 characters for the post text itself (not counting the ANGLE line below).
+REJECT/NEVER (locked anti-patterns): generic motivational content, AI clichés, corporate
+buzzwords, fake personal stories, unsupported statistics, unsupported psychological claims,
+generic "5/7/10 tips" posts, artificial controversy, engagement bait, excessive emojis, excessive
+formatting gimmicks, repetitive structures, generic advice, a blog shortened into LinkedIn form,
+content copied from another platform, excessive promotion, obvious AI language, product mechanism
+disclosure.
+
+PRODUCT PROTECTION (locked) — MAY reveal: problem, situation, behaviour, consequence, observation,
+perspective, partial practical insight. MUST NOT reveal: complete protocol, complete framework,
+proprietary matrix, internal architecture, complete operating procedure, complete implementation
+sequence, internal scoring/decision mechanism. Curiosity must never allow reconstruction of the
+product.
+
+ORDINARY CONTENT TEST (mandatory self-check before you finish): could this reasonably have been
+generated by a generic LinkedIn AI content tool? If yes, rewrite until the answer is no. Target:
+useful + human + original + professionally relevant + intelligent + memorable + platform-native.
 
 Avoid repeating these editorial angles if already used for this Knowledge Unit on LinkedIn: {avoid_intents}
+
+{recent_posts_block}
 
 CANONICAL INSIGHT PACKAGE (your source material — use only what's relevant, don't force every field):
 Core Insight: {core_insight}
@@ -69,17 +134,32 @@ Curiosity Bridge: {curiosity_bridge}
 
 OUTPUT FORMAT (exactly two parts, nothing else):
 Line 1: ANGLE: <one angle from the list above, exactly as written>
-Then a blank line, then the finished post text only — no preamble, no explanation, no headings.
+Then a blank line, then the finished post only (6-9 lines + hashtags as specified above) — no
+preamble, no explanation, no headings, no numbered sections.
 """
 
 
-def generate(cip: dict, product_name: str, avoid_intents: list = None) -> tuple:
+def generate(cip: dict, product_name: str, avoid_intents: list = None, recent_posts: list = None) -> tuple:
     """Returns (content_text, editorial_angle)."""
     avoid_intents = avoid_intents or []
+    recent_posts = recent_posts or []
+
+    if recent_posts:
+        excerpts = "\n---\n".join(p["content_text"][:400] for p in recent_posts[:3])
+        recent_posts_block = (
+            "PREVIOUSLY PUBLISHED POSTS FOR THIS PRODUCT ON LINKEDIN (do NOT repeat the same "
+            "situation, insight, or angle as these — genuinely new ground only):\n---\n"
+            f"{excerpts}\n---"
+        )
+    else:
+        recent_posts_block = ""
+
     prompt = PROMPT_TEMPLATE.format(
         product_name=product_name,
+        product_name_tag=product_name.replace(" ", ""),
         angles=", ".join(ANGLES),
         avoid_intents=", ".join(avoid_intents) if avoid_intents else "none yet",
+        recent_posts_block=recent_posts_block,
         core_insight=cip.get("core_insight", ""),
         real_life_situation=cip.get("real_life_situation", ""),
         hidden_issue=cip.get("hidden_issue", ""),

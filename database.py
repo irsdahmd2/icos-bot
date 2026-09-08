@@ -241,6 +241,44 @@ def log_ecosystem_use(ku_id, platform, editorial_intent):
     }).execute()
 
 
+def get_recent_passed_content(product_id: str, platform: str, limit: int = 5):
+    """Most recent PASSING posts for this product+platform — used by the
+    Duplication/Repetition and Novelty/Editorial Angle audits so a new post
+    is checked against what's actually been published before, not judged
+    in isolation."""
+    res = (
+        get_client().table("generated_content")
+        .select("content_text", "editorial_intent")
+        .eq("product_id", product_id).eq("platform", platform)
+        .eq("audit_status", "PASS")
+        .order("generated_at", desc=True).limit(limit).execute()
+    )
+    return res.data
+
+
+def get_recent_content_other_platforms(product_id: str, ku_id: str, exclude_platform: str, limit: int = 3):
+    """Recent passing posts for the SAME Knowledge Unit on OTHER platforms —
+    used by the Cross-Platform Contamination audit to make sure LinkedIn
+    isn't just a copy of the Blog/Facebook version of the same insight."""
+    res = (
+        get_client().table("generated_content")
+        .select("content_text", "platform")
+        .eq("product_id", product_id).eq("ku_id", ku_id)
+        .neq("platform", exclude_platform)
+        .eq("audit_status", "PASS")
+        .order("generated_at", desc=True).limit(limit).execute()
+    )
+    return res.data
+
+
+def get_other_product_names(exclude_product_id: str):
+    """Every OTHER product's name — used by the Source & Product Identity
+    audit to deterministically catch cross-product contamination in code,
+    rather than leaving it to AI judgment alone."""
+    res = get_client().table("products").select("product_name").neq("product_id", exclude_product_id).execute()
+    return [r["product_name"] for r in res.data]
+
+
 # ---------- Post ID convention: ProductId/Tier/### ----------
 
 def next_post_code(product_id, tier):

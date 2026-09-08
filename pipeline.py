@@ -102,7 +102,15 @@ def _get_ku_group_for_generation(product_id: str, thin_word_threshold: int = 35)
 def generate_for_platform(product_id: str, product_name: str, tier: str, platform: str) -> dict:
     """Command-based generation for ONE platform (locked model, 2026-09-05):
     no daily bundle, no scheduler push — this runs only when the user picks
-    a platform button after /generate."""
+    a platform button after /generate.
+
+    Locked rule: failed content NEVER reaches Telegram. Retries internally,
+    trying a different editorial angle each time, up to config.MAX_AUDIT_RETRIES.
+    Every attempt (pass or fail) is saved to the database for the audit trail,
+    but only a PASSING attempt is ever returned to the caller. If nothing
+    passes within the retry limit, the KU is marked exhausted (so future
+    /generate calls skip it) and an honest failure summary is returned —
+    never the failed post text itself."""
     generator = GENERATORS.get(platform)
     if not generator:
         return {"error": f"No generator built yet for '{platform}'."}
@@ -111,7 +119,6 @@ def generate_for_platform(product_id: str, product_name: str, tier: str, platfor
     if not ku_group:
         return {"error": "No unused Knowledge Units left for this product."}
 
-    # Ensure every KU in the group has a CIP (build any missing ones)
     for ku in ku_group:
         if not db.get_latest_cip_for_ku(ku["ku_id"]):
             dims = extraction.build_cip(ku["core_insight"], ku.get("category", ""), ku.get("raw_source_text", ""))
@@ -119,63 +126,97 @@ def generate_for_platform(product_id: str, product_name: str, tier: str, platfor
 
     merged_cip = _merge_cips(ku_group)
     primary_ku = ku_group[0]
-
-    avoid_intents = db.get_used_intents(primary_ku["ku_id"], platform)
-    content_text, editorial_intent = generator.generate(merged_cip, product_name, avoid_intents)
-
-    post_code = db.next_post_code(product_id, tier)
     cip_id = (db.get_latest_cip_for_ku(primary_ku["ku_id"]) or {}).get("cip_id")
-    content_id = db.save_generated_content(
-        ku_id=primary_ku["ku_id"], cip_id=cip_id, product_id=product_id, tier=tier,
-        platform=platform, editorial_intent=editorial_intent, content_text=content_text,
-        post_code=post_code,
-    )
 
-    audit_status, audit_results = audits.run_audit(content_text, product_name)
-    db.update_audit_result(content_id, audit_status, audit_results)
+    attempts_failed = []
+    for attempt in range(1, config.MAX_AUDIT_RETRIES + 1):
+        avoid_intents = db.get_used_intents(primary_ku["ku_id"], platform)
+        recent_posts = db.get_recent_passed_content(product_id, platform, limit=5)
+        content_text, editorial_intent = generator.generate(merged_cip, product_name, avoid_intents, recent_posts)
+        post_code = db.next_post_code(product_id, tier)
+        content_id = db.save_generated_content(
+            ku_id=primary_ku["ku_id"], cip_id=cip_id, product_id=product_id, tier=tier,
+            platform=platform, editorial_intent=editorial_intent, content_text=content_text,
+            post_code=post_code,
+        )
+        audit_status, audit_results = audits.run_audit(
+            content_text, product_name, product_id, primary_ku["ku_id"],
+            core_insight=merged_cip.get("core_insight", ""), platform=platform,
+        )
+        db.update_audit_result(content_id, audit_status, audit_results)
+        db.log_ecosystem_use(primary_ku["ku_id"], platform, editorial_intent)
 
-    db.mark_kus_used([ku["ku_id"] for ku in ku_group])
-    db.log_ecosystem_use(primary_ku["ku_id"], platform, editorial_intent)
+        if audit_status == "PASS":
+            db.mark_kus_used([ku["ku_id"] for ku in ku_group])
+            return {
+                "content_id": content_id, "post_code": post_code, "platform": platform,
+                "content_text": content_text, "editorial_intent": editorial_intent,
+                "audit_status": audit_status, "audit_results": audit_results,
+                "attempts": attempt,
+            }
 
+        failed_checks = [k for k, v in audit_results.items() if v.get("result") == "FAIL"]
+        attempts_failed.append(failed_checks)
+
+    db.mark_kus_exhausted([ku["ku_id"] for ku in ku_group])
     return {
-        "content_id": content_id,
-        "post_code": post_code,
-        "platform": platform,
-        "content_text": content_text,
-        "editorial_intent": editorial_intent,
-        "audit_status": audit_status,
-        "audit_results": audit_results,
-        "kus_used": len(ku_group),
+        "error": (
+            f"Couldn't produce a passing post after {config.MAX_AUDIT_RETRIES} attempts "
+            f"for this Knowledge Unit. This usually means the source material was too thin "
+            f"or vague for a full post. Recurring failed checks: "
+            f"{', '.join(sorted(set(sum(attempts_failed, []))))}. "
+            f"This Knowledge Unit has been marked exhausted — /generate will move to the "
+            f"next one automatically."
+        ),
     }
 
 
 def refine(content_id: str, product_name: str) -> dict:
     """REFINE button: regenerate, re-audit, return as a NEW VERSION of the
-    same post_code (locked rule) — not a new independent post."""
+    same post_code (locked rule) — not a new independent post. Same
+    never-show-a-failed-post rule as generate_for_platform: retries
+    internally up to config.MAX_AUDIT_RETRIES before giving up honestly."""
     old = db.get_content(content_id)
     if not old:
         return {"error": "Original content not found."}
 
     generator = GENERATORS.get(old["platform"])
-    ku = db.get_knowledge_unit(old["ku_id"])
     cip = db.get_latest_cip_for_ku(old["ku_id"]) or {}
-    avoid_intents = db.get_used_intents(old["ku_id"], old["platform"])
 
-    content_text, editorial_intent = generator.generate(cip, product_name, avoid_intents)
-    new_content_id = db.save_new_version(content_id, content_text, editorial_intent)
+    attempts_failed = []
+    latest_content_id = content_id
+    for attempt in range(1, config.MAX_AUDIT_RETRIES + 1):
+        avoid_intents = db.get_used_intents(old["ku_id"], old["platform"])
+        recent_posts = db.get_recent_passed_content(old["product_id"], old["platform"], limit=5)
+        content_text, editorial_intent = generator.generate(cip, product_name, avoid_intents, recent_posts)
+        new_content_id = db.save_new_version(latest_content_id, content_text, editorial_intent)
+        latest_content_id = new_content_id
 
-    audit_status, audit_results = audits.run_audit(content_text, product_name)
-    db.update_audit_result(new_content_id, audit_status, audit_results)
-    db.log_ecosystem_use(old["ku_id"], old["platform"], editorial_intent)
+        audit_status, audit_results = audits.run_audit(
+            content_text, product_name, old["product_id"], old["ku_id"],
+            core_insight=cip.get("core_insight", ""), platform=old["platform"],
+        )
+        db.update_audit_result(new_content_id, audit_status, audit_results)
+        db.log_ecosystem_use(old["ku_id"], old["platform"], editorial_intent)
+
+        if audit_status == "PASS":
+            return {
+                "content_id": new_content_id, "post_code": old["post_code"], "platform": old["platform"],
+                "content_text": content_text, "editorial_intent": editorial_intent,
+                "audit_status": audit_status, "audit_results": audit_results,
+                "attempts": attempt,
+            }
+
+        failed_checks = [k for k, v in audit_results.items() if v.get("result") == "FAIL"]
+        attempts_failed.append(failed_checks)
 
     return {
-        "content_id": new_content_id,
-        "post_code": old["post_code"],
-        "platform": old["platform"],
-        "content_text": content_text,
-        "editorial_intent": editorial_intent,
-        "audit_status": audit_status,
-        "audit_results": audit_results,
+        "error": (
+            f"Couldn't produce a passing post after {config.MAX_AUDIT_RETRIES} more attempts. "
+            f"Recurring failed checks: {', '.join(sorted(set(sum(attempts_failed, []))))}. "
+            f"The source material for this Knowledge Unit may genuinely be too thin — "
+            f"consider checking the original PDF section it came from."
+        ),
     }
 
 
