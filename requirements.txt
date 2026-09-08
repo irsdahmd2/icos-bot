@@ -1,4 +1,4 @@
-python-telegram-bot==21.6
-supabase==2.9.1
+python-telegram-bot==22.4
+supabase==2.31.0
 pypdf==5.1.0
 google-genai==1.20.0
