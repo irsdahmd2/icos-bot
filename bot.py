@@ -457,7 +457,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
         if error_name in ("NetworkError", "TimedOut"):
             text = "📶 Connection hiccup — nothing broke. Just try that same action again."
         else:
-            text = f"⚠️ Something broke: {context.error}\n\n(Full trace in Termux logs.)"
+            text = f"⚠️ Something broke: {context.error}\n\n(Full trace in Render's Logs tab.)"
         try:
             await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
         except Exception:

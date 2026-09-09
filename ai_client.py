@@ -18,12 +18,22 @@ starting with AQ.) that replaces the older AIza... keys. This file now uses
 the current library so newly-created Gemini keys work correctly.
 """
 
+import time
+
 from google import genai
 from google.genai import types
 
 import config
 
 _client = None
+
+# Transient errors worth retrying automatically instead of surfacing to the
+# user — server overload, rate limits, temporary unavailability. NOT retried:
+# genuine errors (bad API key, invalid request) since retrying those just
+# wastes time and hides a real problem.
+_RETRYABLE_STATUS_CODES = {429, 500, 503, 504}
+_MAX_RETRIES = 3
+_BASE_DELAY_SECONDS = 2
 
 
 class _ContentBlock:
@@ -38,31 +48,52 @@ class _Response:
         self.content = [_ContentBlock(text)]
 
 
+def _is_retryable(error: Exception) -> bool:
+    text = str(error)
+    if any(str(code) in text for code in _RETRYABLE_STATUS_CODES):
+        return True
+    lowered = text.lower()
+    return "unavailable" in lowered or "overloaded" in lowered or "rate limit" in lowered
+
+
 class _Messages:
     def __init__(self, client, model_name):
         self._client = client
         self._model_name = model_name
 
     def create(self, model=None, max_tokens=None, messages=None, **kwargs):
-        """Mimics Anthropic's client.messages.create(...) signature and return shape."""
+        """Mimics Anthropic's client.messages.create(...) signature and return shape.
+        Automatically retries a few times, with a short growing delay, if Gemini's
+        servers are temporarily overloaded — the caller never needs to know this
+        happened; it just gets a normal successful response, or a real error only
+        after genuinely exhausting retries."""
         prompt = messages[0]["content"]
         gen_config = None
         if max_tokens:
             gen_config = types.GenerateContentConfig(max_output_tokens=max_tokens)
 
-        response = self._client.models.generate_content(
-            model=self._model_name,
-            contents=prompt,
-            config=gen_config,
-        )
+        last_error = None
+        for attempt in range(1, _MAX_RETRIES + 1):
+            try:
+                response = self._client.models.generate_content(
+                    model=self._model_name,
+                    contents=prompt,
+                    config=gen_config,
+                )
+                try:
+                    text = response.text
+                except Exception:
+                    # Gemini sometimes returns no text if it hit a safety filter etc.
+                    text = ""
+                return _Response(text)
+            except Exception as e:
+                last_error = e
+                if attempt < _MAX_RETRIES and _is_retryable(e):
+                    time.sleep(_BASE_DELAY_SECONDS * attempt)
+                    continue
+                raise
 
-        try:
-            text = response.text
-        except Exception:
-            # Gemini sometimes returns no text if it hit a safety filter etc.
-            text = ""
-
-        return _Response(text)
+        raise last_error
 
 
 class GeminiCompatClient:
