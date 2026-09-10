@@ -173,7 +173,7 @@ def generate(cip: dict, product_name: str, avoid_intents: list = None, recent_po
     )
     response = get_client().messages.create(
         model=config.AI_MODEL,
-        max_tokens=1000,
+        max_tokens=2500,
         messages=[{"role": "user", "content": prompt}]
     )
     raw = response.content[0].text.strip()
