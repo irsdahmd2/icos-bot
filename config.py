@@ -27,6 +27,16 @@ OWNER_TELEGRAM_ID = os.environ.get("OWNER_TELEGRAM_ID", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 AI_MODEL = "gemini-3.6-flash"
 
+# --- Fallback AI Provider: Groq (free tier, no card required) ---
+# Used ONLY when Gemini is temporarily overloaded/unavailable after its own
+# retries are exhausted (e.g. the 503 UNAVAILABLE error). Gemini stays the
+# PRIMARY provider for quality reasons — this is strictly an emergency
+# backup so a temporary Gemini outage doesn't stall generation.
+# Optional: if GROQ_API_KEY is left blank, the bot behaves exactly as
+# before (no fallback attempted, same as pre-fallback behavior).
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_FALLBACK_MODEL = "llama-3.3-70b-versatile"
+
 # --- Database: Supabase (Postgres) ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
