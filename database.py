@@ -144,6 +144,15 @@ def add_knowledge_unit(product_id, tier, category, core_insight, raw_source_text
     return ku_id
 
 
+def get_all_core_insights_for_product(product_id):
+    """Every core_insight already stored for this product, across ALL tiers
+    (Codex, Handbook, Full OS) uploaded so far — used to check new candidate
+    KUs from a newly-uploaded tier against what's already been captured, so
+    the same underlying insight reworded across tiers isn't saved twice."""
+    res = get_client().table("knowledge_units").select("core_insight").eq("product_id", product_id).execute()
+    return [row["core_insight"] for row in res.data if row.get("core_insight")]
+
+
 def get_knowledge_unit(ku_id):
     res = get_client().table("knowledge_units").select("*").eq("ku_id", ku_id).execute()
     return res.data[0] if res.data else None
