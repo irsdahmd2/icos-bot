@@ -1,13 +1,14 @@
 """
-ICOS Audit Engine — LinkedIn Audit Engine v1.0 (LOCKED, per Irshad's spec document).
+ICOS Audit Engine — LinkedIn Audit Engine v2.0 (LOCKED, per Irshad's spec document).
 
-Implements the official 12 audit categories from the locked spec, plus two
+Implements the official 12 audit categories from the locked spec, plus three
 code-level structural checks that are deterministic rather than AI-judged
 (more reliable, and they're facts, not opinions):
 
 CODE-LEVEL (facts, not judgment calls):
   - source_product_identity  : scans for any OTHER product's name in the text
-  - structure_check           : 6-9 lines/paragraphs (locked 2026-09-08 rule)
+  - structure_check           : 8-14 short paragraphs (locked 2026-09-13 v2.0 rule)
+  - hook_length_check         : opening paragraph <= 210 chars (mobile "See more" cutoff)
   - hashtags_check             : 3-5 relevant hashtags present at the end
 
 AI-JUDGED (the 11 remaining official categories, one combined call):
@@ -23,6 +24,15 @@ AI-JUDGED (the 11 remaining official categories, one combined call):
   11. ordinary_content_test
   12. novelty_editorial_angle      (checked against this product's actual past posts/angles)
 
+CHANGED 2026-09-13 (v1.0 -> v2.0), to match generator_linkedin.py's v2.0 rewrite:
+- structure_check range changed from 6-9 lines to 8-14 short paragraphs.
+- Added hook_length_check: new code-level check enforcing the ~210-character mobile
+  truncation point found in 2026 LinkedIn engagement research — the single highest-leverage
+  lever found across multiple independent studies, more than total post length.
+- linkedin_native_quality and human_writing checks now also judge plain-language use and
+  whether the core insight is given a specific name/label (the authority mechanism) rather
+  than only described in general terms.
+
 CHANGED 2026-09-08: full rewrite against Irshad's actual locked audit spec.
 Replaces the earlier ad-hoc 10-check version. Duplication, cross-platform
 contamination, and novelty are now REAL checks against real past content
@@ -35,10 +45,11 @@ import config
 import database as db
 from ai_client import get_client
 
-MIN_LINES = 6
-MAX_LINES = 9
+MIN_LINES = 8
+MAX_LINES = 14
 MIN_HASHTAGS = 3
 MAX_HASHTAGS = 5
+MAX_HOOK_CHARS = 210
 
 AI_JUDGED_CHECKS = [
     "knowledge_unit_integrity", "duplication_repetition", "editorial_drift",
@@ -74,10 +85,13 @@ CHECKS:
    insight lands at the right point, practical value present, natural CTA). FAIL if it reads like a
    generic article, shortened blog, motivational quote, sales ad, or disconnected tips list.
 4. linkedin_native_quality — feels deliberately written for LinkedIn: professional relevance,
-   scannability, natural paragraph rhythm, credible opening, no unnecessary jargon.
+   scannability, natural paragraph rhythm, credible opening, no unnecessary jargon. Plain,
+   concrete words are preferred over long or corporate/consultant vocabulary — precision should
+   come from specificity, not from formal-sounding language.
 5. value — would this post still be useful if the reader never clicked the product? Genuine
    insight and practical takeaway required; reject empty motivation or obvious statements dressed
-   up as profound.
+   up as profound. The core insight should be given a short, specific name or label (not just
+   described in general terms) — that specificity is what signals real domain expertise.
 6. human_writing — no AI clichés, corporate buzzwords, "in today's fast-paced world" style
    openers, robotic transitions, forced storytelling, or over-polished unnatural language. Would
    an intelligent human professional genuinely write and publish this?
@@ -123,14 +137,29 @@ def _source_product_identity_check(content_text: str, other_product_names: list)
 
 
 def _structure_check(content_text: str) -> dict:
-    """Locked 2026-09-08 rule: 6-9 short lines/paragraphs, not counting the
+    """Locked 2026-09-13 v2.0 rule: 8-14 short paragraphs, not counting the
     trailing hashtag line."""
     lines = [l.strip() for l in content_text.split("\n") if l.strip()]
     body_lines = [l for l in lines if not _is_hashtag_line(l)]
     n = len(body_lines)
     if MIN_LINES <= n <= MAX_LINES:
-        return {"result": "PASS", "reason": f"{n} lines, within the {MIN_LINES}-{MAX_LINES} range."}
-    return {"result": "FAIL", "reason": f"{n} lines — outside the required {MIN_LINES}-{MAX_LINES} range."}
+        return {"result": "PASS", "reason": f"{n} paragraphs, within the {MIN_LINES}-{MAX_LINES} range."}
+    return {"result": "FAIL", "reason": f"{n} paragraphs — outside the required {MIN_LINES}-{MAX_LINES} range."}
+
+
+def _hook_length_check(content_text: str) -> dict:
+    """Locked 2026-09-13 v2.0 rule: the opening paragraph must work standalone
+    under ~210 characters — LinkedIn's actual mobile 'See more' truncation
+    point. Research across multiple 2026 studies found this the single
+    highest-leverage lever for engagement, more than total post length."""
+    lines = [l.strip() for l in content_text.split("\n") if l.strip()]
+    if not lines:
+        return {"result": "FAIL", "reason": "Post is empty."}
+    hook = lines[0]
+    n = len(hook)
+    if n <= MAX_HOOK_CHARS:
+        return {"result": "PASS", "reason": f"Hook is {n} characters, within the {MAX_HOOK_CHARS}-character mobile cutoff."}
+    return {"result": "FAIL", "reason": f"Hook is {n} characters — exceeds the {MAX_HOOK_CHARS}-character mobile 'See more' cutoff."}
 
 
 def _hashtags_check(content_text: str) -> dict:
@@ -157,6 +186,7 @@ def run_audit(content_text: str, product_name: str, product_id: str, ku_id: str,
             content_text, db.get_other_product_names(product_id)
         ),
         "structure_check": _structure_check(content_text),
+        "hook_length_check": _hook_length_check(content_text),
         "hashtags_check": _hashtags_check(content_text),
     }
 
