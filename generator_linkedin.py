@@ -1,20 +1,29 @@
 """
-LinkedIn Generator — LinkedIn Master Format v1.0 (LOCKED, per Irshad's spec document).
+LinkedIn Generator — LinkedIn Master Format v2.0 (LOCKED, per Irshad's spec document).
 
 CORE PRINCIPLE (locked):
 ONE KNOWLEDGE UNIT -> CIP -> MASTER EDITORIAL CORE -> LINKEDIN-NATIVE
 TRANSFORMATION -> LINKEDIN AUDIT -> MASTER PRODUCT AUDIT -> APPROVAL -> PUBLICATION
 
-CHANGED 2026-09-08:
-- Rewritten against Irshad's actual locked LinkedIn Master Format v1.0 document
-  (13-stage editorial flow + full anti-pattern list + explicit Product
-  Protection may/must-not + Information Density + Voice, verbatim from spec).
-- Structure changed from a fixed 750-900 character range to a LINE-based
-  structure (locked 2026-09-08): 6-9 short, dense lines/paragraphs following
-  Hook -> Body -> Curiosity bridge -> Product, ending with relevant hashtags.
-- Takes recent_posts (this product's last few PASSING LinkedIn posts) so the
-  model actively avoids repeating a situation/insight it already used —
-  proactive novelty, not just after-the-fact audit rejection.
+CHANGED 2026-09-13 (v1.0 -> v2.0), based on 2026 LinkedIn algorithm/engagement research
+(AuthoredUp, MagicPost, van der Blom Algorithm Insights — cross-checked across multiple
+independent studies):
+- Structure changed from "6-9 dense lines" to 8-14 SHORT paragraphs (1-3 sentences each,
+  one idea per paragraph). Same total length, restructured for scannability — dense
+  multi-clause paragraphs measurably underperform short ones regardless of total length.
+- New HOOK CONSTRAINT: the opening must work standalone in under ~210 characters — the
+  actual mobile "See more" truncation point. This is the single highest-leverage lever,
+  more than total post length.
+- New AUTHORITY MECHANISM: name the hidden pattern with a short, specific label (not just
+  describe it) — this is what reads as deep domain expertise, not vocabulary complexity.
+- New PLAIN LANGUAGE rule: short, concrete words beat long/corporate ones — research shows
+  posts using longer average word length measurably underperform.
+- New SAVE-PROMPT line before the CTA — saves are now one of the most heavily-weighted
+  algorithm signals, more than likes.
+- Hashtags are now explicitly topic-derived per post, not a fixed rotating set.
+- Takes recent_posts (this product's last few PASSING LinkedIn posts) so the model actively
+  avoids repeating a situation/insight it already used — proactive novelty, not just
+  after-the-fact audit rejection.
 """
 
 import config
@@ -27,20 +36,25 @@ ANGLES = [
 
 PROMPT_TEMPLATE = """You are writing a LinkedIn post for INAYA SOLUTIONS, for the product "{product_name}".
 
-This is the LOCKED LinkedIn Master Format v1.0. Follow this exact editorial architecture as the
+This is the LOCKED LinkedIn Master Format v2.0. Follow this exact editorial architecture as the
 underlying structure of the post — it must NOT appear as visible numbered headings, it must read
 as one natural, flowing piece of writing:
 
 REAL PROFESSIONAL PROBLEM -> SCROLL-STOPPING RECOGNITION -> SITUATION MIRROR -> HIDDEN TENSION ->
-WHY IT HAPPENS -> REFRAME -> CORE INSIGHT -> PRACTICAL APPLICATION -> CONSEQUENCE/WHAT-IF ->
-MEMORABLE CLOSE -> REFLECTION/CONVERSATION -> PRODUCT CURIOSITY BRIDGE -> SOFT PRODUCT CTA
+WHY IT HAPPENS -> REFRAME -> NAMED CORE INSIGHT -> PRACTICAL APPLICATION -> CONSEQUENCE/WHAT-IF ->
+MEMORABLE CLOSE -> REFLECTION/CONVERSATION -> SAVE PROMPT -> PRODUCT CURIOSITY BRIDGE -> SOFT
+PRODUCT CTA
 
-1. RECOGNITION-FIRST OPENING — start inside a real professional problem. Entry angles: pain
-   recognition, contradiction, unexpected observation, professional question, specific situation,
-   consequence, behaviour, hidden mechanism, perspective. The opening must make the reader think
-   "that happens" / "I've seen this" / "I've done this" / "that's an interesting problem."
-   NEVER: "Today I want to discuss...", generic motivation, generic company intro, artificial
-   controversy, "In today's fast-paced world...", obvious AI-style hooks.
+1. RECOGNITION-FIRST OPENING (HARD CONSTRAINT) — must work completely on its own in under 210
+   characters, because that is LinkedIn's actual mobile "See more" truncation point — everything
+   after it only gets read if this line alone earns the tap. One short, concrete, plain-language
+   line or two. NEVER a long compound/multi-clause sentence here — save complexity for later in
+   the post. Entry angles: pain recognition, contradiction, unexpected observation, professional
+   question, specific situation, consequence, behaviour, hidden mechanism, perspective. The
+   opening must make the reader think "that happens" / "I've seen this" / "I've done this" /
+   "that's an interesting problem." NEVER: "Today I want to discuss...", generic motivation,
+   generic company intro, artificial controversy, "In today's fast-paced world...", obvious
+   AI-style hooks.
 
 2. SITUATION MIRROR — a concrete, recognisable workplace situation. Specific behaviour, realistic
    tension, everyday professional circumstances, human reactions, believable consequences. Avoid
@@ -57,8 +71,12 @@ MEMORABLE CLOSE -> REFLECTION/CONVERSATION -> PRODUCT CURIOSITY BRIDGE -> SOFT P
    issue is Y." (visible->hidden, behaviour->consequence, symptom->cause, assumption->alternative,
    immediate->long-term, individual->systemic).
 
-6. CORE INSIGHT — ONE strong central insight, not a collection of generic tips. The reader must be
-   able to answer "what did I actually learn?" with one clear answer.
+6. NAMED CORE INSIGHT (AUTHORITY MECHANISM) — ONE strong central insight, not a collection of
+   generic tips. Give the hidden pattern a short, specific, memorable name or label rather than
+   only describing it in general terms (e.g. "this has a name: X" / "this is what X actually is").
+   Naming the pattern precisely is what signals deep domain expertise — not longer words or more
+   formal vocabulary. The reader must be able to answer "what did I actually learn?" with one
+   clear answer.
 
 7. PRACTICAL VALUE — something the reader can notice/question/test/recognise/apply. Genuine
    standalone value. Stop before revealing the complete proprietary product solution.
@@ -72,28 +90,40 @@ MEMORABLE CLOSE -> REFLECTION/CONVERSATION -> PRODUCT CURIOSITY BRIDGE -> SOFT P
 10. REFLECTION/CONVERSATION — end with a genuine question connected to the issue, giving the
     reader something meaningful to consider. NEVER "Agree?" / "Thoughts?" / "Comment below!"
 
-11. PRODUCT CURIOSITY BRIDGE — natural progression: PROBLEM -> UNDERSTANDING -> DEEPER STRUCTURED
+11. SAVE PROMPT — one short, naturally-phrased line encouraging the reader to save the post for
+    later (saves are one of the most heavily-weighted signals for reach). Phrase it fresh for
+    this specific post's content, not a copy-pasted stock line every time.
+
+12. PRODUCT CURIOSITY BRIDGE — natural progression: PROBLEM -> UNDERSTANDING -> DEEPER STRUCTURED
     SOLUTION EXISTS -> PRODUCT CURIOSITY. Never abruptly switch from insight to advertising. The
     reader should naturally think "if this problem can be understood this deeply, I wonder what
     the complete product contains."
 
-12. SOFT PRODUCT CTA — mention ONLY "{product_name}", relevant to the problem discussed, explain
+13. SOFT PRODUCT CTA — mention ONLY "{product_name}", relevant to the problem discussed, explain
     why the reader may want to explore it, low-pressure, never dominates the post. Never mention
     any other product.
 
-13. EDITORIAL ANGLE — choose the STRONGEST angle for this specific insight from exactly this list:
+14. EDITORIAL ANGLE — choose the STRONGEST angle for this specific insight from exactly this list:
     {angles}
     Do not reuse the same opening/narrative pattern repeatedly.
 
-INFORMATION DENSITY (locked): dense in meaning, light in reading effort. Short paragraphs,
-whitespace, clear progression, simple language, deliberate emphasis, bullets only when genuinely
-useful. Do not optimize merely for shortness — optimize for meaningful reading.
+PLAIN LANGUAGE (locked): favor short, concrete, everyday words over long or corporate/consultant
+words. "Structural vulnerability" -> "a weak point." "Operational continuity" -> "things keep
+running." Precision comes from naming the pattern specifically (see step 6), not from vocabulary
+complexity. Longer average word length measurably reduces engagement.
 
-STRUCTURE (locked 2026-09-08, overrides any earlier character-count rule): write the post as
-6 to 9 short, dense lines/paragraphs (each line a distinct beat — hook, situation, insight, value,
-close/curiosity as appropriate), structured overall as: HOOK -> BODY -> CURIOSITY BRIDGE TOWARD
-{product_name} -> then end with 3-5 relevant hashtags on their own final line (e.g.
-#Leadership #WorkplaceCulture #{product_name_tag}).
+INFORMATION DENSITY (locked): dense in meaning, light in reading effort. Do not optimize merely
+for shortness — optimize for meaningful reading.
+
+STRUCTURE (locked 2026-09-13, v2.0 — overrides any earlier line-count rule): write the post as
+8 to 14 SHORT paragraphs, each just 1-3 sentences carrying exactly ONE idea — never stack multiple
+ideas or clauses into one paragraph. Use a blank line between every paragraph for scannability.
+Overall shape: HOOK (under 210 characters, standalone) -> SITUATION/BODY (several short
+paragraphs) -> NAMED INSIGHT -> CONSEQUENCE -> MEMORABLE CLOSE -> REFLECTION QUESTION -> SAVE
+PROMPT -> CURIOSITY BRIDGE TOWARD {product_name} -> then end with 3-5 hashtags on their own final
+line, chosen specifically for THIS post's actual topic and insight (not a fixed recycled set) —
+always include one INAYA/product-related tag among them (e.g. #{product_name_tag}), the rest
+should vary post to post based on what this specific post is actually about.
 
 VOICE (locked): Professional, Human, Calm, Practical, Evidence-aware, Intellectually useful,
 Minimal, Operational. It should feel like an experienced person explaining an important
@@ -104,7 +134,7 @@ buzzwords, fake personal stories, unsupported statistics, unsupported psychologi
 generic "5/7/10 tips" posts, artificial controversy, engagement bait, excessive emojis, excessive
 formatting gimmicks, repetitive structures, generic advice, a blog shortened into LinkedIn form,
 content copied from another platform, excessive promotion, obvious AI language, product mechanism
-disclosure.
+disclosure, a copy-pasted save-prompt line reused identically post after post.
 
 PRODUCT PROTECTION (locked) — MAY reveal: problem, situation, behaviour, consequence, observation,
 perspective, partial practical insight. MUST NOT reveal: complete protocol, complete framework,
@@ -143,8 +173,8 @@ Curiosity Bridge: {curiosity_bridge}
 
 OUTPUT FORMAT (exactly two parts, nothing else):
 Line 1: ANGLE: <one angle from the list above, exactly as written>
-Then a blank line, then the finished post only (6-9 lines + hashtags as specified above) — no
-preamble, no explanation, no headings, no numbered sections.
+Then a blank line, then the finished post only (8-14 short paragraphs + hashtags as specified
+above) — no preamble, no explanation, no headings, no numbered sections.
 """
 
 
