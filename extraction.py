@@ -66,6 +66,29 @@ No other text before or after the JSON.
 """
 
 
+DEDUP_PROMPT = """You are comparing NEWLY extracted candidate Knowledge Units for a product against
+Knowledge Units ALREADY STORED for that SAME product from a different tier (e.g. the Codex 6-10 page
+version, the Handbook 35-50 page version, or the Full OS 150+ page version). The same product's tiers
+share the same core proprietary content at different depths — the same underlying insight very often
+reappears reworded, expanded, or condensed across two or three tiers. Your job is to catch that.
+
+A NEW candidate is a DUPLICATE if it expresses the same underlying insight as an EXISTING one, even if
+the wording, length, or specific examples differ. A NEW candidate is UNIQUE only if it introduces an
+idea not meaningfully covered by anything already stored.
+
+EXISTING INSIGHTS ALREADY STORED FOR THIS PRODUCT:
+{existing_list}
+
+NEW CANDIDATE INSIGHTS (numbered from 0):
+{new_list}
+
+Return ONLY a valid JSON array of the index numbers (integers) of NEW candidates that are genuinely
+UNIQUE and should be kept — e.g. [0, 2, 5]. Exclude any index that duplicates an existing insight OR
+duplicates another new candidate you've already decided to keep. If everything is unique, return all
+indices. No other text before or after the JSON array.
+"""
+
+
 def extract_knowledge_units(product_text: str, tier: str) -> list:
     """Send product text to the AI, get back a tier-appropriate list of
     distinct Knowledge Units."""
@@ -85,6 +108,36 @@ def extract_knowledge_units(product_text: str, tier: str) -> list:
         return json.loads(raw)
     except json.JSONDecodeError:
         return []
+
+
+def filter_duplicate_kus(new_kus: list, existing_insights: list) -> list:
+    """Cross-tier dedup: given newly extracted candidate KUs and every
+    core_insight already stored for this product (from any other tier already
+    uploaded), return only the candidates that are genuinely new/unique.
+    If there are no existing insights yet (first tier ever uploaded for this
+    product), everything is unique by definition — skip the AI call entirely."""
+    if not existing_insights or not new_kus:
+        return new_kus
+
+    existing_list = "\n".join(f"- {insight}" for insight in existing_insights)
+    new_list = "\n".join(f"{i}: {ku.get('core_insight', '')}" for i, ku in enumerate(new_kus))
+
+    response = get_client().messages.create(
+        model=config.AI_MODEL,
+        max_tokens=1000,
+        messages=[{"role": "user", "content": DEDUP_PROMPT.format(
+            existing_list=existing_list, new_list=new_list
+        )}]
+    )
+    raw = _strip_code_fences(response.content[0].text.strip())
+    try:
+        keep_indices = set(json.loads(raw))
+    except (json.JSONDecodeError, TypeError):
+        # If the dedup check itself fails to parse, fail safe by keeping
+        # everything rather than silently discarding real content.
+        return new_kus
+
+    return [ku for i, ku in enumerate(new_kus) if i in keep_indices]
 
 
 def build_cip(core_insight: str, category: str, source_excerpt: str) -> dict:
