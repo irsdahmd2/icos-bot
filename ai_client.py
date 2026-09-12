@@ -48,6 +48,35 @@ class _Response:
         self.content = [_ContentBlock(text)]
 
 
+def _call_groq_fallback(prompt: str, max_tokens: int = None) -> str:
+    """One-shot emergency fallback to Groq's free API (OpenAI-compatible)
+    when Gemini is temporarily down. Only called after Gemini has already
+    exhausted its own retries. Requires GROQ_API_KEY — if it's not set,
+    this function is never reached (see the caller above)."""
+    import json
+    import urllib.request
+
+    body = {
+        "model": config.GROQ_FALLBACK_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if max_tokens:
+        body["max_tokens"] = max_tokens
+
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {config.GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data["choices"][0]["message"]["content"]
+
+
 def _is_retryable(error: Exception) -> bool:
     text = str(error)
     if any(str(code) in text for code in _RETRYABLE_STATUS_CODES):
@@ -91,7 +120,21 @@ class _Messages:
                 if attempt < _MAX_RETRIES and _is_retryable(e):
                     time.sleep(_BASE_DELAY_SECONDS * attempt)
                     continue
-                raise
+                break  # retries exhausted (or non-retryable) — fall through below
+
+        # Gemini failed after exhausting its own retries. If this was a genuine
+        # overload/unavailable error (not a bad key or malformed request) and a
+        # Groq fallback key is configured, try ONE Groq call before giving up —
+        # keeps generation/audit moving during a temporary Gemini outage instead
+        # of failing the attempt outright. Gemini remains primary; this never
+        # runs unless Gemini has already failed.
+        if _is_retryable(last_error) and config.GROQ_API_KEY:
+            try:
+                text = _call_groq_fallback(prompt, max_tokens)
+                print("[ai_client] Gemini unavailable after retries — used Groq fallback.")
+                return _Response(text)
+            except Exception as fallback_error:
+                print(f"[ai_client] Groq fallback also failed: {fallback_error}")
 
         raise last_error
 
