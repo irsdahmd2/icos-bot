@@ -466,8 +466,9 @@ def get_status_counts():
 
 
 def get_per_product_dashboard():
-    """Serial# | Product | KU counts per tier | posts generated | audit-passed |
-    confirmed published. Returns a list of dicts, one per product."""
+    """Serial# | Product | KU counts per tier + total | posts generated |
+    audit-passed | awaiting publish (with actual Post IDs) | confirmed
+    published. Returns a list of dicts, one per product."""
     products = get_all_products()
     rows = []
     for p in products:
@@ -478,20 +479,30 @@ def get_per_product_dashboard():
             t = ku.get("tier")
             if t in counts:
                 counts[t] += 1
+        total_kus = sum(counts.values())
 
         content_rows = get_client().table("generated_content").select(
-            "audit_status", "status"
+            "post_code", "audit_status", "status"
         ).eq("product_id", p["product_id"]).execute().data
         posts_generated = len(content_rows)
         audit_passed = len([c for c in content_rows if c.get("audit_status") == "PASS"])
         confirmed_published = len([c for c in content_rows if c.get("status") == "confirmed_published"])
+        # Passed audit but not yet confirmed published — the actual backlog
+        # waiting on you, with real Post IDs, not just a count.
+        awaiting = [
+            c["post_code"] for c in content_rows
+            if c.get("audit_status") == "PASS" and c.get("status") != "confirmed_published"
+        ]
 
         rows.append({
             "product_id": p["product_id"],
             "product_name": p["product_name"],
             **counts,
+            "total_kus": total_kus,
             "posts_generated": posts_generated,
             "audit_passed": audit_passed,
+            "awaiting_publish_count": len(awaiting),
+            "awaiting_publish_codes": awaiting,
             "confirmed_published": confirmed_published,
         })
     return rows
