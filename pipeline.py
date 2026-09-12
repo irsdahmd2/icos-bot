@@ -42,11 +42,20 @@ import audits
 
 
 def process_new_product(product_name: str, tier: str, source_filename: str, raw_text: str) -> dict:
-    """Upload -> tier confirm -> extraction. Returns a summary dict for the
-    Telegram confirmation message."""
+    """Upload -> tier confirm -> extraction -> cross-tier dedup. Returns a
+    summary dict for the Telegram confirmation message."""
     product_id = db.add_or_get_product(product_name, tier, source_filename)
 
     ku_dicts = extraction.extract_knowledge_units(raw_text, tier)
+    candidate_count = len(ku_dicts)
+
+    # Cross-tier dedup: if this product already has KUs from a different tier
+    # (Codex, Handbook, or Full OS uploaded earlier), check new candidates
+    # against everything already stored and keep only genuinely unique ones.
+    existing_insights = db.get_all_core_insights_for_product(product_id)
+    ku_dicts = extraction.filter_duplicate_kus(ku_dicts, existing_insights)
+    duplicates_skipped = candidate_count - len(ku_dicts)
+
     saved = 0
     for ku in ku_dicts:
         db.add_knowledge_unit(
@@ -58,7 +67,10 @@ def process_new_product(product_name: str, tier: str, source_filename: str, raw_
         )
         saved += 1
 
-    return {"product_id": product_id, "product_name": product_name, "tier": tier, "ku_count": saved}
+    return {
+        "product_id": product_id, "product_name": product_name, "tier": tier,
+        "ku_count": saved, "duplicates_skipped": duplicates_skipped,
+    }
 
 
 def _merge_cips(ku_group: list) -> dict:
