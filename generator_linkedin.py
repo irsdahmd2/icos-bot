@@ -120,14 +120,23 @@ Avoid repeating these editorial angles if already used for this Knowledge Unit o
 
 {recent_posts_block}
 
-CANONICAL INSIGHT PACKAGE (your source material — use only what's relevant, don't force every field):
+CANONICAL INSIGHT PACKAGE (your source material — use only what's relevant, don't force every field.
+Blank fields mean that dimension genuinely doesn't apply to this Knowledge Unit — do not invent
+content for a blank field):
 Core Insight: {core_insight}
 Real-life Situation: {real_life_situation}
 Hidden Issue: {hidden_issue}
+Overlooked Fact: {overlooked_fact}
 Psychological Dimension: {psychological_dimension}
 Behavioral Dimension: {behavioral_dimension}
 Common Behaviour: {common_behaviour}
 Alternative Perspective: {alternative_perspective}
+Misconception: {misconception}
+Decision Point: {decision_point}
+Communication Problem: {communication_problem}
+Operational Problem: {operational_problem}
+What-If Scenario: {what_if_scenario}
+What Happens If Ignored: {what_if_ignored}
 Practical Insight: {practical_insight}
 Reflection: {reflection}
 Curiosity Bridge: {curiosity_bridge}
@@ -163,10 +172,17 @@ def generate(cip: dict, product_name: str, avoid_intents: list = None, recent_po
         core_insight=cip.get("core_insight", ""),
         real_life_situation=cip.get("real_life_situation", ""),
         hidden_issue=cip.get("hidden_issue", ""),
+        overlooked_fact=cip.get("overlooked_fact", ""),
         psychological_dimension=cip.get("psychological_dimension", ""),
         behavioral_dimension=cip.get("behavioral_dimension", ""),
         common_behaviour=cip.get("common_behaviour", ""),
         alternative_perspective=cip.get("alternative_perspective", ""),
+        misconception=cip.get("misconception", ""),
+        decision_point=cip.get("decision_point", ""),
+        communication_problem=cip.get("communication_problem", ""),
+        operational_problem=cip.get("operational_problem", ""),
+        what_if_scenario=cip.get("what_if_scenario", ""),
+        what_if_ignored=cip.get("what_if_ignored", ""),
         practical_insight=cip.get("practical_insight", ""),
         reflection=cip.get("reflection", ""),
         curiosity_bridge=cip.get("curiosity_bridge", ""),
