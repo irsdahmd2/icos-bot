@@ -301,11 +301,17 @@ async def handle_tier_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     del _pending_uploads[chat_id]
 
+    dup_line = ""
+    if result.get("duplicates_skipped"):
+        dup_line = f"⏭️ Skipped {result['duplicates_skipped']} duplicate insight(s) already covered by another tier.\n\n"
+
     await _send_with_retry(
         context, chat_id,
         text=(f"✅ Processing complete.\n\n"
               f"Product: {result['product_name']}\n"
-              f"Tier: {result['tier']}\n\n"
+              f"Tier: {result['tier']}\n"
+              f"Unique Knowledge Units saved: {result['ku_count']}\n\n"
+              f"{dup_line}"
               f"Ready to generate posts — tap Generate Today's Post whenever you're ready.")
     )
     await refresh_pinned_dashboard(chat_id, context)
