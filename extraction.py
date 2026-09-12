@@ -39,18 +39,28 @@ PRODUCT TEXT:
 
 CIP_PROMPT = """You are building a Canonical Insight Package (CIP) from ONE approved Knowledge Unit
 (or a combined group of related Knowledge Units), for INAYA SOLUTIONS. The CIP is the complete
-intellectual source that all platform content will later be adapted from — so be thorough, but
-do NOT invent anything not reasonably implied by the core insight below. Leave a field as an
-empty string "" if it genuinely doesn't apply.
+intellectual source that EVERY platform (LinkedIn, Blog, Facebook, Instagram, Pinterest, YouTube
+Short, YouTube Podcast) will later draw its own selective subset from — so be thorough across
+every dimension that genuinely applies, but do NOT invent anything not reasonably implied by the
+core insight below.
+
+Different products lean on different dimensions naturally — a decision-making product will surface
+strong decision_point and misconception material; a household/operations product will surface
+strong operational_problem and hidden_issue material; a workplace-conduct product will surface
+strong communication_problem material. Do not force every field to be equally rich. Leave a field
+as an empty string "" if it genuinely doesn't apply to this Knowledge Unit — a forced, generic
+answer is worse than an honest blank, because a later platform generator may pick that field as
+its angle and produce a weak post from thin material.
 
 CORE INSIGHT: {core_insight}
 CATEGORY: {category}
 SOURCE CONTEXT: {source_excerpt}
 
 Return ONLY valid JSON with these exact keys (all strings):
-core_insight, real_life_situation, hidden_issue, psychological_dimension, behavioral_dimension,
-positive_value, negative_value, common_behaviour, alternative_perspective, practical_insight,
-reflection, curiosity_bridge
+core_insight, real_life_situation, hidden_issue, overlooked_fact, psychological_dimension,
+behavioral_dimension, positive_value, negative_value, common_behaviour, alternative_perspective,
+misconception, decision_point, communication_problem, operational_problem, what_if_scenario,
+what_if_ignored, practical_insight, reflection, curiosity_bridge
 
 No other text before or after the JSON.
 """
@@ -78,9 +88,13 @@ def extract_knowledge_units(product_text: str, tier: str) -> list:
 
 
 def build_cip(core_insight: str, category: str, source_excerpt: str) -> dict:
+    # NOTE: raised from 1500 -> 3000 when the CIP expanded from 12 to 19 fields
+    # (2026-09-12) — same truncation lesson learned the hard way on
+    # generator_linkedin.py and audits.py. Do not lower this without checking
+    # actual output length first.
     response = get_client().messages.create(
         model=config.AI_MODEL,
-        max_tokens=1500,
+        max_tokens=3000,
         messages=[{"role": "user", "content": CIP_PROMPT.format(
             core_insight=core_insight, category=category, source_excerpt=source_excerpt
         )}]
