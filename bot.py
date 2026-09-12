@@ -169,12 +169,17 @@ def _render_dashboard_text():
         return "📊 Dashboard (live)\n\nNo products uploaded yet."
     lines = ["📊 Dashboard (live — stays updated in place)\n"]
     for i, r in enumerate(rows, 1):
-        lines.append(
+        block = (
             f"{i}. {r['product_name']}\n"
-            f"   📚 KUs — Full OS: {r['Full_OS']} | Handbook: {r['Handbook']} | Codex: {r['Codex']}\n"
-            f"   ✍️ Posts generated: {r['posts_generated']} | ✅ Audit passed: {r['audit_passed']} "
-            f"| 📤 Confirmed published: {r['confirmed_published']}"
+            f"   📚 KUs extracted — Total: {r['total_kus']} "
+            f"(Full OS: {r['Full_OS']} | Handbook: {r['Handbook']} | Codex: {r['Codex']})\n"
+            f"   ✍️ Posts generated: {r['posts_generated']} | ✅ Audit passed: {r['audit_passed']}\n"
+            f"   📤 Confirmed published: {r['confirmed_published']}"
         )
+        if r["awaiting_publish_count"]:
+            codes = ", ".join(r["awaiting_publish_codes"])
+            block += f"\n   🟡 Awaiting publish ({r['awaiting_publish_count']}): {codes}"
+        lines.append(block)
     return "\n\n".join(lines)
 
 
@@ -437,6 +442,7 @@ async def handle_ready_to_publish(update: Update, context: ContextTypes.DEFAULT_
         query.message.text + "\n\n📤 Marked READY TO PUBLISH — go publish it manually, "
         "then come back and tap Confirm Published."
     )
+    await refresh_pinned_dashboard(query.message.chat_id, context)
 
 
 async def handle_confirm_published(update: Update, context: ContextTypes.DEFAULT_TYPE):
