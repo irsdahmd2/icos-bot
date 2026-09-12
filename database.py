@@ -199,6 +199,13 @@ def save_cip(ku_id, dimensions: dict):
         "practical_insight": dimensions.get("practical_insight", ""),
         "reflection": dimensions.get("reflection", ""),
         "curiosity_bridge": dimensions.get("curiosity_bridge", ""),
+        "overlooked_fact": dimensions.get("overlooked_fact", ""),
+        "misconception": dimensions.get("misconception", ""),
+        "decision_point": dimensions.get("decision_point", ""),
+        "communication_problem": dimensions.get("communication_problem", ""),
+        "operational_problem": dimensions.get("operational_problem", ""),
+        "what_if_scenario": dimensions.get("what_if_scenario", ""),
+        "what_if_ignored": dimensions.get("what_if_ignored", ""),
         "created_at": now(),
     }).execute()
     return cip_id
