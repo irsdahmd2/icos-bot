@@ -220,7 +220,11 @@ def run_audit(content_text: str, product_name: str, product_id: str, ku_id: str,
 
     response = get_client().messages.create(
         model=config.AI_MODEL,
-        max_tokens=2500,
+        # RAISED 2026-09-13: same hidden-reasoning-token risk as
+        # generator_linkedin.py — this audit call was hitting the same model
+        # with the same undersized budget, likely contributing to
+        # audit_parse_error on posts that were themselves truncated inputs.
+        max_tokens=8000,
         messages=[{"role": "user", "content": AUDIT_PROMPT.format(
             content_text=content_text, product_name=product_name, core_insight=core_insight or "N/A",
             recent_posts_block=recent_posts_block, other_platform_block=other_platform_block,
