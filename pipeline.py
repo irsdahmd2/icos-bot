@@ -95,9 +95,13 @@ def _merge_cips(ku_group: list) -> dict:
     return merged
 
 
-def _get_ku_group_for_generation(product_id: str, thin_word_threshold: int = 35) -> list:
-    """Locked rule (2026-09-05): combine up to config.MAX_KU_COMBINE unused
-    KUs into one post when a single KU's core insight is too thin on its own."""
+def _get_ku_group_for_generation(product_id: str, thin_word_threshold: int = 15) -> list:
+    """Locked rule (2026-09-05, threshold lowered 2026-09-13): combine up to
+    config.MAX_KU_COMBINE (now 2) unused KUs into one post ONLY when a single
+    KU's core insight is genuinely fragment-thin on its own. Threshold lowered
+    from 35 to 15 words — most solid 1-2 sentence insights are 20-40 words and
+    should stand alone as their own post; the old threshold was merging far
+    more KUs than necessary, cutting total publishable post count."""
     first = db.get_unused_knowledge_units(product_id, limit=1)
     if not first:
         return []
