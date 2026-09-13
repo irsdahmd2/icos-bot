@@ -48,10 +48,28 @@ VALID_TIERS = ["Full_OS", "Handbook", "Codex"]
 # Full OS = deepest/most, Handbook = concept-level/medium, Codex = fastest/least).
 # These are guidance ranges given to the AI extractor, not hard caps.
 TIER_KU_TARGET = {
-    "Full_OS": (8, 15),
-    "Handbook": (5, 10),
-    "Codex": (3, 6),
+    # RAISED 2026-09-13: the old ranges (Full_OS 8-15, Handbook 5-10, Codex 3-6)
+    # were an artificial ceiling that had nothing to do with how much genuine
+    # content each tier actually contains. A real 51-page Handbook was found
+    # to contain 20+ distinct content sections (Emergency Anchor Card,
+    # Household Identification, Lifeboat Protocol, Knowledge Loss Audit,
+    # Disaster Recovery Timeline, Weekly Reset SOP, Daily Household
+    # Dashboard, Child Profile Tracker, and more) — far more than 10 KUs
+    # worth of extractable insight. New ranges are set to genuinely scale
+    # with each tier's real page count (Codex 6-10pp, Handbook 35-50pp,
+    # Full OS 150+pp), not an arbitrary round number.
+    "Full_OS": (40, 100),
+    "Handbook": (20, 50),
+    "Codex": (3, 8),
 }
+
+# RAISED 2026-09-13: extraction was silently truncating product text to the
+# first 15,000 characters before ever showing it to the AI — a 66,000
+# character Handbook only ever had its first ~23% actually read. Raised to
+# cover a full Handbook or Codex; a true 150+ page Full OS may still exceed
+# this and need chunked extraction later, but this is a large improvement
+# over the previous silent 15,000-character cutoff.
+EXTRACTION_TEXT_LIMIT = 100000
 
 # --- Platforms — add new ones here as their generator files are built ---
 # A platform only shows up as a button in Telegram once its generator module exists.
@@ -64,7 +82,10 @@ ACTIVE_PLATFORMS = ["linkedin"]
 
 # Max Knowledge Units that may be combined into a single post when one KU
 # alone is too thin (locked decision, 2026-09-05): combine up to this many.
-MAX_KU_COMBINE = 5
+MAX_KU_COMBINE = 2  # LOWERED 2026-09-13: was 5 — silently collapsing up to 5
+# potential standalone posts into a single post. Irshad's explicit priority is
+# maximum publishable post volume; combining is now reserved for genuinely
+# thin KUs paired with exactly one other, never a 5-way merge.
 
 # Locked rule: failed content NEVER reaches Telegram. If a generated post
 # fails audit, the pipeline retries internally (different angle each time)
