@@ -92,12 +92,15 @@ indices. No other text before or after the JSON array.
 def extract_knowledge_units(product_text: str, tier: str) -> list:
     """Send product text to the AI, get back a tier-appropriate list of
     distinct Knowledge Units."""
-    text = product_text[:15000]
+    text = product_text[:config.EXTRACTION_TEXT_LIMIT]
     min_ku, max_ku = config.TIER_KU_TARGET.get(tier, (3, 8))
 
     response = get_client().messages.create(
         model=config.AI_MODEL,
-        max_tokens=4000,
+        # RAISED 2026-09-13: with KU targets raised as high as 100 for Full OS,
+        # the output JSON list itself got much bigger — same truncation lesson
+        # learned the hard way earlier on generator_linkedin.py and audits.py.
+        max_tokens=16000,
         messages=[{"role": "user", "content": EXTRACTION_PROMPT.format(
             text=text, tier=tier, min_ku=min_ku, max_ku=max_ku
         )}]
@@ -111,20 +114,28 @@ def extract_knowledge_units(product_text: str, tier: str) -> list:
 
 
 def filter_duplicate_kus(new_kus: list, existing_insights: list) -> list:
-    """Cross-tier dedup: given newly extracted candidate KUs and every
-    core_insight already stored for this product (from any other tier already
-    uploaded), return only the candidates that are genuinely new/unique.
-    If there are no existing insights yet (first tier ever uploaded for this
-    product), everything is unique by definition — skip the AI call entirely."""
-    if not existing_insights or not new_kus:
+    """Cross-tier AND intra-batch dedup: given newly extracted candidate KUs
+    and every core_insight already stored for this product (from any other
+    tier already uploaded), return only the candidates that are genuinely
+    new/unique — including catching duplicates WITHIN this same batch (e.g.
+    two sections of the same document expressing the same underlying idea),
+    not just duplicates against previously uploaded tiers. This runs even on
+    the very first tier ever uploaded for a product, since a single large
+    extraction batch can still contain internal near-duplicates."""
+    if not new_kus:
         return new_kus
+    if len(new_kus) < 2 and not existing_insights:
+        return new_kus  # nothing to compare against either way
 
-    existing_list = "\n".join(f"- {insight}" for insight in existing_insights)
+    existing_list = (
+        "\n".join(f"- {insight}" for insight in existing_insights)
+        if existing_insights else "None yet — this is the first tier uploaded for this product."
+    )
     new_list = "\n".join(f"{i}: {ku.get('core_insight', '')}" for i, ku in enumerate(new_kus))
 
     response = get_client().messages.create(
         model=config.AI_MODEL,
-        max_tokens=1000,
+        max_tokens=1500,
         messages=[{"role": "user", "content": DEDUP_PROMPT.format(
             existing_list=existing_list, new_list=new_list
         )}]
