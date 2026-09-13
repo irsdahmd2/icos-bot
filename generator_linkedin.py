@@ -236,7 +236,13 @@ def generate(cip: dict, product_name: str, avoid_intents: list = None, recent_po
     )
     response = get_client().messages.create(
         model=config.AI_MODEL,
-        max_tokens=2500,
+        # RAISED 2026-09-13: real HOS posts were being cut off mid-sentence even
+        # at under 500 visible characters — far too short to need 2500 tokens
+        # of visible text. AI_MODEL is a reasoning-capable model with no
+        # thinking_config set, so it likely spends an unpredictable chunk of
+        # the budget on hidden internal reasoning before writing any visible
+        # text. Raised with real headroom rather than guessing a small bump.
+        max_tokens=8000,
         messages=[{"role": "user", "content": prompt}]
     )
     raw = response.content[0].text.strip()
