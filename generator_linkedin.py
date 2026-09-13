@@ -115,6 +115,23 @@ complexity. Longer average word length measurably reduces engagement.
 INFORMATION DENSITY (locked): dense in meaning, light in reading effort. Do not optimize merely
 for shortness — optimize for meaningful reading.
 
+ELITE CRAFT (locked, applies on top of everything above): write like a world-class LinkedIn
+copywriter, not just a compliant format-follower.
+- MONEY LINE: include exactly one sentence designed to be the most quotable, screenshot-worthy
+  line in the post — almost always the named core insight (step 6), stated as a clean, standalone
+  truth someone would want to repeat or save on its own.
+- RHYTHM: vary sentence length deliberately. Do not let every paragraph run the same length or
+  cadence. A short, blunt line followed by a slightly longer explanatory one reads as confident,
+  practiced writing; uniform-length sentences throughout read as generated and flat.
+- CONCRETE OVER ABSTRACT: wherever the CIP's real_life_situation is available, use it — specific,
+  situational, almost visual detail beats abstract description every time. Prefer "the phone rings
+  at 6am and no one else knows the pediatrician's name" over "critical information is often
+  centralized in one person."
+- NO HEDGING: state the insight directly and confidently. Avoid weak qualifiers ("might," "could
+  potentially," "in some cases," "sort of") that dilute authority — say the true thing plainly.
+  This is about confident phrasing of the real insight, never about fabricating certainty the
+  source material doesn't support.
+
 STRUCTURE (locked 2026-09-13, v2.0 — overrides any earlier line-count rule): write the post as
 8 to 14 SHORT paragraphs, each just 1-3 sentences carrying exactly ONE idea — never stack multiple
 ideas or clauses into one paragraph. Use a blank line between every paragraph for scannability.
