@@ -24,7 +24,7 @@ CHANGED 2026-09-05:
 import json
 import re
 import uuid
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 
 from supabase import create_client, Client
 
@@ -521,3 +521,98 @@ def set_setting(key: str, value: str):
         get_client().table("bot_settings").update({"value": value}).eq("key", key).execute()
     else:
         get_client().table("bot_settings").insert({"key": key, "value": value}).execute()
+
+
+# ---------------------------------------------------------------------------
+# ENGAGEMENT TRACKING — NEW 2026-09-13. Lets Irshad send a LinkedIn (or later,
+# any platform) analytics screenshot to the bot every 4-5 days, and have the
+# actual like/comment/share numbers stored against the real Post ID, so
+# quarterly/half-yearly trend questions ("which angle/product performs best")
+# can be answered from real data instead of guessing.
+# ---------------------------------------------------------------------------
+
+def get_published_posts_by_platform(platform, limit=100):
+    """ALL confirmed-published posts for ONE specific platform — used for
+    precise screenshot matching, not just the most recent handful. Matching
+    is scoped to a single platform first (detected from the screenshot's UI)
+    so a LinkedIn screenshot is never compared against Blog or Instagram
+    posts, and vice versa."""
+    res = get_client().table("generated_content").select(
+        "content_id", "post_code", "platform", "content_text", "published_at"
+    ).eq("status", "confirmed_published").eq("platform", platform).order(
+        "published_at", desc=True
+    ).limit(limit).execute()
+    return res.data
+
+
+def get_recent_published_posts(limit=8):
+    """Most recently confirmed-published posts, for the 'which post is this
+    screenshot for?' confirmation step — never auto-attach engagement data
+    to a post without the user confirming which one it is."""
+    res = get_client().table("generated_content").select(
+        "content_id", "post_code", "platform", "content_text", "published_at"
+    ).eq("status", "confirmed_published").order("published_at", desc=True).limit(limit).execute()
+    return res.data
+
+
+def save_post_engagement(content_id, post_code, platform, likes, comments, shares, impressions, notes=""):
+    eng_id = new_id("eng_")
+    get_client().table("post_engagement").insert({
+        "engagement_id": eng_id,
+        "content_id": content_id,
+        "post_code": post_code,
+        "platform": platform,
+        "likes": likes or 0,
+        "comments": comments or 0,
+        "shares": shares or 0,
+        "impressions": impressions,
+        "recorded_at": now(),
+        "notes": notes or "",
+    }).execute()
+    return eng_id
+
+
+def get_engagement_report(days=None):
+    """Real engagement rows, joined with each post's angle and product, for
+    trend analysis (weekly / quarterly / half-yearly). If days is given,
+    only engagement RECORDED in that window — not post-published date —
+    since a post can gain engagement well after it was first published."""
+    query = get_client().table("post_engagement").select(
+        "post_code", "platform", "likes", "comments", "shares", "impressions", "recorded_at", "content_id"
+    ).order("recorded_at", desc=True)
+    res = query.execute()
+    rows = res.data
+    if days:
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        rows = [r for r in rows if r["recorded_at"] >= cutoff]
+
+    # Enrich with editorial angle + product for genuine "what performs best" analysis
+    enriched = []
+    for r in rows:
+        content = get_client().table("generated_content").select(
+            "editorial_angle", "product_id"
+        ).eq("content_id", r["content_id"]).execute().data
+        angle = content[0]["editorial_angle"] if content else ""
+        product_id = content[0]["product_id"] if content else ""
+        enriched.append({**r, "editorial_angle": angle, "product_id": product_id})
+    return enriched
+
+
+def get_recent_activity_counts(days=7):
+    """Posts generated / audit-passed / confirmed-published within the last
+    N days, broken down by platform — powers weekly/monthly Q&A answers."""
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    rows = get_client().table("generated_content").select(
+        "platform", "audit_status", "status", "generated_at", "published_at"
+    ).gte("generated_at", cutoff).execute().data
+
+    by_platform = {}
+    for r in rows:
+        p = r.get("platform", "unknown")
+        by_platform.setdefault(p, {"generated": 0, "audit_passed": 0, "published": 0})
+        by_platform[p]["generated"] += 1
+        if r.get("audit_status") == "PASS":
+            by_platform[p]["audit_passed"] += 1
+        if r.get("status") == "confirmed_published":
+            by_platform[p]["published"] += 1
+    return by_platform
