@@ -14,6 +14,7 @@ import asyncio
 import os
 import logging
 import traceback
+import json
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -33,6 +34,7 @@ logger = logging.getLogger("icos")
 # Keyed by chat_id. This resets if the bot restarts, which is fine — it only
 # holds a pending upload, not anything durable.
 _pending_uploads = {}
+_pending_engagement = {}
 
 
 def _owner_only(update: Update) -> bool:
@@ -140,17 +142,13 @@ async def handle_menu_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def post_init(application: Application):
-    """Runs once, right when `python3 bot.py` starts — sends the welcome
-    message automatically so you don't have to type /start every time."""
-    if not config.OWNER_TELEGRAM_ID:
-        return
-    try:
-        await send_welcome(int(config.OWNER_TELEGRAM_ID), application)
-    except Exception as e:
-        logger.warning(
-            f"Could not send startup welcome message: {e}. "
-            f"If this is the very first run, message the bot with /start once first."
-        )
+    """Runs once, right when `python3 bot.py` starts. CHANGED 2026-09-13:
+    used to auto-send the welcome menu on every restart — but Render restarts
+    the bot on every deploy and occasionally on the free tier, which meant
+    unsolicited messages Irshad never asked for. Per his explicit preference
+    (system should only speak when asked, never self-showcase), this now
+    just logs quietly instead of messaging Telegram at all."""
+    logger.info("ICOS bot started — no startup message sent (by design; use /start when you want it).")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -231,6 +229,212 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """NEW 2026-09-13, PRECISION MATCHING added same day: send an analytics
+    screenshot from ANY platform, and the bot (1) identifies which platform
+    the screenshot is actually from by its UI, (2) pulls ONLY that
+    platform's published posts as candidates — never mixing platforms —
+    (3) runs a real content-match on the post's own visible text against
+    those candidates, and (4) presents the single best match for a one-tap
+    confirm, with a manual fallback list if no confident match is found.
+    Numbers are NEVER auto-attached without the user confirming which post."""
+    if not _owner_only(update):
+        return
+    chat_id = update.effective_chat.id
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    image_bytes = bytes(await file.download_as_bytearray())
+
+    await update.message.reply_text("🔎 Reading the screenshot...")
+
+    extraction_prompt = (
+        "This is a screenshot of a social media post's analytics (likes, comments, "
+        "shares/reposts, possibly impressions). Identify which platform this screenshot "
+        "is from based on its visual UI (icons, layout, colors, terminology) — one of: "
+        "linkedin, facebook, instagram, pinterest, blog, youtube_short, youtube_podcast, "
+        "or unknown if you genuinely can't tell. Read the engagement numbers exactly as "
+        "shown. Also transcribe the first ~20 words of the post's own text if visible "
+        "anywhere in the screenshot, word for word, so it can be matched to the correct "
+        "stored post — this is the most important field, be as exact as possible. "
+        "Return ONLY valid JSON with these exact keys: platform (string), likes (integer), "
+        "comments (integer), shares (integer), impressions (integer or null), "
+        "post_text_snippet (string, exact transcription, empty string if none visible). "
+        "No other text before or after the JSON."
+    )
+    raw = ai_client.generate_with_image(extraction_prompt, image_bytes, mime_type="image/jpeg")
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = "\n".join(l for l in raw.split("\n") if not l.strip().startswith("```"))
+    try:
+        metrics = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        await update.message.reply_text(
+            "⚠️ Couldn't read clear numbers from that screenshot — try a clearer/closer crop "
+            "of the likes, comments, and shares."
+        )
+        return
+
+    detected_platform = (metrics.get("platform") or "").lower().strip()
+    snippet = (metrics.get("post_text_snippet") or "").strip()
+
+    candidates = db.get_published_posts_by_platform(detected_platform) if detected_platform in PLATFORM_LABELS else []
+    if not candidates:
+        # Platform wasn't identified confidently, or nothing published yet on
+        # that platform — fall back to the recent-across-all-platforms list
+        # rather than silently failing.
+        candidates = db.get_recent_published_posts(limit=8)
+
+    if not candidates:
+        await update.message.reply_text("No confirmed-published posts on record yet to match this against.")
+        return
+
+    _pending_engagement[chat_id] = metrics
+    best_match = None
+    if snippet and len(candidates) > 1:
+        best_match = await asyncio.to_thread(_match_post_by_snippet, snippet, candidates)
+
+    metrics_line = (
+        f"📊 Platform detected: {detected_platform or 'unknown'}\n"
+        f"👍 {metrics.get('likes',0)} | 💬 {metrics.get('comments',0)} | 🔁 {metrics.get('shares',0)}"
+        + (f" | 👁️ {metrics['impressions']}" if metrics.get("impressions") else "")
+    )
+    if snippet:
+        metrics_line += f"\nDetected post snippet: \"{snippet}\""
+
+    if best_match:
+        keyboard = [
+            [InlineKeyboardButton(
+                f"✅ Yes — {best_match['post_code']}",
+                callback_data=f"engage|{chat_id}|{best_match['content_id']}|{best_match['post_code']}|{best_match['platform']}"
+            )],
+            [InlineKeyboardButton("Show other options instead", callback_data=f"engagemore|{chat_id}|{detected_platform}")],
+        ]
+        await update.message.reply_text(
+            f"{metrics_line}\n\nBest match found: **{best_match['post_code']}** — confirm?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    else:
+        keyboard = [
+            [InlineKeyboardButton(
+                f"{c['post_code']} ({c['platform']})",
+                callback_data=f"engage|{chat_id}|{c['content_id']}|{c['post_code']}|{c['platform']}"
+            )]
+            for c in candidates[:8]
+        ]
+        await update.message.reply_text(
+            f"{metrics_line}\n\nNo confident automatic match — which post is this for?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+
+def _match_post_by_snippet(snippet: str, candidates: list):
+    """Real content-matching, not a guess: asks the AI to pick the single
+    candidate whose stored content_text genuinely contains/matches the
+    screenshot's transcribed opening text. Returns None (not a forced guess)
+    if no candidate is a confident match, so the caller falls back to a
+    manual list instead of silently attaching to the wrong post."""
+    listing = "\n".join(
+        f"{i}: post_code={c['post_code']} | opening_text=\"{c['content_text'][:120]}\""
+        for i, c in enumerate(candidates)
+    )
+    prompt = (
+        "A social media analytics screenshot showed this transcribed opening text from a post:\n"
+        f"\"{snippet}\"\n\n"
+        f"Here are candidate stored posts:\n{listing}\n\n"
+        "Which candidate index is genuinely the SAME post (allowing for minor transcription "
+        "errors)? Return ONLY a JSON object: {\"match_index\": <integer>} if confident, or "
+        "{\"match_index\": null} if none are a real match. No other text."
+    )
+    try:
+        response = ai_client.get_client().messages.create(
+            model=config.AI_MODEL, max_tokens=200,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = "\n".join(l for l in raw.split("\n") if not l.strip().startswith("```"))
+        result = json.loads(raw)
+        idx = result.get("match_index")
+        if idx is not None and 0 <= idx < len(candidates):
+            return candidates[idx]
+    except Exception:
+        pass
+    return None
+
+
+async def handle_engagement_show_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fallback path from the 'Show other options instead' button — lists
+    candidates for manual selection instead of the auto-matched guess."""
+    query = update.callback_query
+    await _safe_answer(query, "Showing options")
+    _, chat_id_str, detected_platform = query.data.split("|")
+    chat_id = int(chat_id_str)
+    candidates = db.get_published_posts_by_platform(detected_platform) if detected_platform in PLATFORM_LABELS else []
+    if not candidates:
+        candidates = db.get_recent_published_posts(limit=8)
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{c['post_code']} ({c['platform']})",
+            callback_data=f"engage|{chat_id}|{c['content_id']}|{c['post_code']}|{c['platform']}"
+        )]
+        for c in candidates[:8]
+    ]
+    await query.edit_message_text("Which post is this for?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_engagement_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query, "Saved")
+    _, chat_id_str, content_id, post_code, platform = query.data.split("|")
+    chat_id = int(chat_id_str)
+    metrics = _pending_engagement.pop(chat_id, None)
+    if not metrics:
+        await query.edit_message_text("⚠️ That screenshot's data expired — please resend it.")
+        return
+
+    db.save_post_engagement(
+        content_id=content_id, post_code=post_code, platform=platform,
+        likes=metrics.get("likes", 0), comments=metrics.get("comments", 0),
+        shares=metrics.get("shares", 0), impressions=metrics.get("impressions"),
+    )
+    await query.edit_message_text(
+        f"✅ Saved engagement for {post_code}: 👍 {metrics.get('likes',0)} | "
+        f"💬 {metrics.get('comments',0)} | 🔁 {metrics.get('shares',0)}"
+    )
+
+
+async def insights(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/insights — plain-language trend analysis over REAL saved engagement
+    data (which angles/products/posts perform best). Distinct from the
+    stats Q&A, which only knows counts, not performance."""
+    if not _owner_only(update):
+        return
+    rows = db.get_engagement_report()
+    if not rows:
+        await update.message.reply_text(
+            "No engagement data recorded yet — send a screenshot of a post's analytics "
+            "(likes/comments/shares) every few days and I'll track it here."
+        )
+        return
+    data_summary = "\n".join(
+        f"- {r['post_code']} ({r['platform']}, angle={r.get('editorial_angle','')}): "
+        f"likes={r['likes']}, comments={r['comments']}, shares={r['shares']}, "
+        f"recorded={r['recorded_at'][:10]}"
+        for r in rows
+    )
+    prompt = (
+        "You are ICOS's data assistant. Using ONLY the real engagement data below, answer "
+        "which editorial angles, products, or posts are performing best and worst, in 3-4 "
+        "short plain sentences. Never invent a number not in the data.\n\n"
+        f"DATA:\n{data_summary}\n\nQUESTION: {' '.join(context.args) if context.args else 'Summarize overall performance so far.'}"
+    )
+    response = ai_client.get_client().messages.create(
+        model=config.AI_MODEL, max_tokens=500,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    await update.message.reply_text(response.content[0].text.strip())
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Two jobs: (1) capture the product name right after a PDF upload, or
     (2) if that's not what's happening, treat the message as a plain-language
@@ -274,12 +478,19 @@ async def _answer_stats_question(update: Update, context: ContextTypes.DEFAULT_T
         f"confirmed_published={r['confirmed_published']}"
         for r in rows
     )
+    last_7 = db.get_recent_activity_counts(days=7)
+    last_30 = db.get_recent_activity_counts(days=30)
+    recent_summary = (
+        "LAST 7 DAYS by platform: " + json.dumps(last_7) +
+        "\nLAST 30 DAYS by platform: " + json.dumps(last_30)
+    )
     prompt = (
         "You are ICOS's data assistant. Answer the user's question using ONLY the real data "
         "below — never invent a number. Reply in one or two short plain sentences, no markdown, "
         "no headers. If the question doesn't match any product name closely, say which products "
         "you do have data for instead of guessing.\n\n"
-        f"DATA:\n{stats_summary}\n\nQUESTION: {update.message.text.strip()}"
+        f"ALL-TIME DATA:\n{stats_summary}\n\nRECENT ACTIVITY:\n{recent_summary}\n\n"
+        f"QUESTION: {update.message.text.strip()}"
     )
     response = ai_client.get_client().messages.create(
         model=config.AI_MODEL, max_tokens=300,
@@ -320,7 +531,6 @@ async def handle_tier_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
               f"Ready to generate posts — tap Generate Today's Post whenever you're ready.")
     )
     await refresh_pinned_dashboard(chat_id, context)
-    await send_welcome(chat_id, context)
 
 
 PLATFORM_LABELS = {
@@ -528,7 +738,9 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("dashboard", dashboard))
     app.add_handler(CommandHandler("generate", generate))
+    app.add_handler(CommandHandler("insights", insights))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_screenshot))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.add_handler(CallbackQueryHandler(handle_menu_choice, pattern=r"^menu\|"))
@@ -537,6 +749,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_refine, pattern=r"^refine\|"))
     app.add_handler(CallbackQueryHandler(handle_ready_to_publish, pattern=r"^ready\|"))
     app.add_handler(CallbackQueryHandler(handle_confirm_published, pattern=r"^confirm\|"))
+    app.add_handler(CallbackQueryHandler(handle_engagement_confirm, pattern=r"^engage\|"))
+    app.add_handler(CallbackQueryHandler(handle_engagement_show_more, pattern=r"^engagemore\|"))
 
     app.add_error_handler(on_error)
 
