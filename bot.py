@@ -694,11 +694,13 @@ def _extract_pdf_text(pdf_bytes: bytes) -> str:
 
 
 def _start_keepalive_server_if_needed():
-    """Render (and similar free-tier hosts) require the app to answer HTTP
-    requests on the port they assign, or they consider it dead. This has NO
-    effect on Termux — it only activates when a PORT environment variable is
-    present, which Termux never sets. Runs in a background thread so it
-    doesn't interfere with the bot's own polling loop at all."""
+    """Termux/local fallback ONLY (polling mode). Render (and similar hosts)
+    require the app to answer HTTP requests on the assigned port or they
+    consider it dead — but as of 2026-09-16 the Render deploy uses
+    run_webhook() instead (see main()), which already binds and answers on
+    that port itself, so this lightweight server is now skipped whenever
+    RENDER_EXTERNAL_URL is set. It only still matters for a polling run
+    that nonetheless has a PORT set (rare, kept for safety)."""
     port = os.environ.get("PORT")
     if not port:
         return
@@ -721,7 +723,6 @@ def _start_keepalive_server_if_needed():
 
 
 def main():
-    _start_keepalive_server_if_needed()
     db.init_db()
     app = (
         Application.builder()
@@ -754,8 +755,31 @@ def main():
 
     app.add_error_handler(on_error)
 
-    logger.info("ICOS bot starting...")
-    app.run_polling()
+    # CHANGED 2026-09-16: webhook mode on Render, so the service only needs
+    # inbound HTTP (which resets Render's free-tier 15-min spin-down timer)
+    # instead of an always-open outbound polling connection (which generates
+    # NO inbound traffic and would leave a genuine Free instance asleep
+    # almost permanently). RENDER_EXTERNAL_URL is set automatically by
+    # Render on every web service — nothing to configure manually. Falls
+    # back to polling automatically when that variable is absent (Termux,
+    # local dev, or any non-Render environment), so nothing else changes
+    # there.
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+    port = int(os.environ.get("PORT", "10000"))
+    if render_url:
+        webhook_path = config.TELEGRAM_BOT_TOKEN  # token-as-path: only Telegram knows this URL
+        logger.info(f"ICOS bot starting in WEBHOOK mode on port {port} ({render_url})...")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=webhook_path,
+            webhook_url=f"{render_url}/{webhook_path}",
+            secret_token=config.TELEGRAM_BOT_TOKEN.replace(":", ""),
+        )
+    else:
+        _start_keepalive_server_if_needed()
+        logger.info("ICOS bot starting in POLLING mode (no RENDER_EXTERNAL_URL set)...")
+        app.run_polling()
 
 
 if __name__ == "__main__":
