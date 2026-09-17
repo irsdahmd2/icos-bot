@@ -769,6 +769,7 @@ def main():
     if render_url:
         webhook_path = config.TELEGRAM_BOT_TOKEN  # token-as-path: only Telegram knows this URL
         logger.info(f"ICOS bot starting in WEBHOOK mode on port {port} ({render_url})...")
+        logger.info(f"Groq fallback key present: {bool(config.GROQ_API_KEY)}")
         app.run_webhook(
             listen="0.0.0.0",
             port=port,
@@ -779,6 +780,7 @@ def main():
     else:
         _start_keepalive_server_if_needed()
         logger.info("ICOS bot starting in POLLING mode (no RENDER_EXTERNAL_URL set)...")
+        logger.info(f"Groq fallback key present: {bool(config.GROQ_API_KEY)}")
         app.run_polling()
 
 
