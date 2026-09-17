@@ -1,5 +1,5 @@
 """
-ICOS Audit Engine — LinkedIn Audit Engine v2.0 (LOCKED, per Irshad's spec document).
+ICOS Audit Engine — LinkedIn Audit Engine v2.2 (LOCKED, per Irshad's spec document).
 
 Implements the official 12 audit categories from the locked spec, plus three
 code-level structural checks that are deterministic rather than AI-judged
@@ -7,7 +7,7 @@ code-level structural checks that are deterministic rather than AI-judged
 
 CODE-LEVEL (facts, not judgment calls):
   - source_product_identity  : scans for any OTHER product's name in the text
-  - structure_check           : 8-14 short paragraphs (locked 2026-09-13 v2.0 rule)
+  - structure_check           : 80-140 total words (v2.2 rule, replaces paragraph counting)
   - hook_length_check         : opening paragraph <= 210 chars (mobile "See more" cutoff)
   - hashtags_check             : 3-5 relevant hashtags present at the end
 
@@ -33,6 +33,16 @@ CHANGED 2026-09-13 (v1.0 -> v2.0), to match generator_linkedin.py's v2.0 rewrite
   whether the core insight is given a specific name/label (the authority mechanism) rather
   than only described in general terms.
 
+CHANGED 2026-09-16 (v2.0 -> v2.1), per Irshad's direct request: real posts were drifting as
+long as 16 paragraphs. structure_check's range tightened from 8-14 down to a hard 8-9 short
+paragraphs, matching generator_linkedin.py's v2.1 rewrite. No other checks changed.
+
+CHANGED 2026-09-16 (v2.1 -> v2.2), per Irshad's reference examples from his own LinkedIn feed
+(terse, broken-line, personally-reflective posts): structure_check switched from counting
+paragraphs to counting total WORDS (80-140), matching generator_linkedin.py's v2.2 rewrite —
+paragraph/line counting no longer reliably measures length once sentences are deliberately
+broken across multiple short lines. No other checks changed.
+
 CHANGED 2026-09-08: full rewrite against Irshad's actual locked audit spec.
 Replaces the earlier ad-hoc 10-check version. Duplication, cross-platform
 contamination, and novelty are now REAL checks against real past content
@@ -45,8 +55,8 @@ import config
 import database as db
 from ai_client import get_client
 
-MIN_LINES = 8
-MAX_LINES = 14
+MIN_WORDS = 80
+MAX_WORDS = 140
 MIN_HASHTAGS = 3
 MAX_HASHTAGS = 5
 MAX_HOOK_CHARS = 210
@@ -137,14 +147,17 @@ def _source_product_identity_check(content_text: str, other_product_names: list)
 
 
 def _structure_check(content_text: str) -> dict:
-    """Locked 2026-09-13 v2.0 rule: 8-14 short paragraphs, not counting the
-    trailing hashtag line."""
+    """Locked 2026-09-16 v2.2 rule: 80-140 words total (excluding the trailing
+    hashtag line), replacing the earlier 8-9 paragraph-count rule. Word count
+    is what actually captures the broken-line rhythm the format now uses —
+    a single sentence may deliberately span 2-3 short lines, so counting
+    lines no longer reliably measures length."""
     lines = [l.strip() for l in content_text.split("\n") if l.strip()]
     body_lines = [l for l in lines if not _is_hashtag_line(l)]
-    n = len(body_lines)
-    if MIN_LINES <= n <= MAX_LINES:
-        return {"result": "PASS", "reason": f"{n} paragraphs, within the {MIN_LINES}-{MAX_LINES} range."}
-    return {"result": "FAIL", "reason": f"{n} paragraphs — outside the required {MIN_LINES}-{MAX_LINES} range."}
+    word_count = sum(len(l.split()) for l in body_lines)
+    if MIN_WORDS <= word_count <= MAX_WORDS:
+        return {"result": "PASS", "reason": f"{word_count} words, within the {MIN_WORDS}-{MAX_WORDS} range."}
+    return {"result": "FAIL", "reason": f"{word_count} words — outside the required {MIN_WORDS}-{MAX_WORDS} range."}
 
 
 def _hook_length_check(content_text: str) -> dict:
