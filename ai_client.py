@@ -131,10 +131,10 @@ class _Messages:
         if _is_retryable(last_error) and config.GROQ_API_KEY:
             try:
                 text = _call_groq_fallback(prompt, max_tokens)
-                print("[ai_client] Gemini unavailable after retries — used Groq fallback.")
+                print("[ai_client] Gemini unavailable after retries — used Groq fallback.", flush=True)
                 return _Response(text)
             except Exception as fallback_error:
-                print(f"[ai_client] Groq fallback also failed: {fallback_error}")
+                print(f"[ai_client] Groq fallback also failed: {fallback_error}", flush=True)
 
         raise last_error
 
