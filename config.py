@@ -35,7 +35,7 @@ AI_MODEL = "gemini-3.6-flash"
 # Optional: if GROQ_API_KEY is left blank, the bot behaves exactly as
 # before (no fallback attempted, same as pre-fallback behavior).
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_FALLBACK_MODEL = "llama-3.3-70b-versatile"
+GROQ_FALLBACK_MODEL = "openai/gpt-oss-120b"
 
 # --- Database: Supabase (Postgres) ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
