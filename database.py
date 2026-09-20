@@ -508,6 +508,121 @@ def get_per_product_dashboard():
     return rows
 
 
+# ---------------------------------------------------------------------------
+# NEW 2026-09-19 — Dashboard v3: one line per Product + Tier.
+# Shows how many Knowledge Units are still AVAILABLE out of the total
+# extracted, plus how many current posts are ready to publish / published.
+# The KU text itself is NOT part of this — it is fetched on demand only
+# (get_kus_for_product_tier, used by the /kus command).
+# get_per_product_dashboard() above is left untouched (the plain-language
+# stats Q&A still uses it).
+# ---------------------------------------------------------------------------
+
+TIER_ORDER = ["Full_OS", "Handbook", "Codex"]
+TIER_LABELS = {"Full_OS": "Full OS", "Handbook": "Handbook", "Codex": "Codex"}
+
+
+def _fetch_all(table, columns, order_col, page=1000):
+    """Reads EVERY row of a table in pages. Supabase silently caps a single
+    request at 1000 rows, and the full catalog (~78 products x up to 3
+    tiers x up to 100 KUs) can pass that, so a plain .execute() could
+    quietly under-count."""
+    rows, start = [], 0
+    while True:
+        res = (
+            get_client().table(table).select(columns)
+            .order(order_col).range(start, start + page - 1).execute()
+        )
+        batch = res.data or []
+        rows.extend(batch)
+        if len(batch) < page:
+            break
+        start += page
+    return rows
+
+
+def get_dashboard_by_tier():
+    """Returns a list (one dict per product, upload order) like:
+    {product_id, product_name, tiers: [
+        {tier, label, total, available, used, exhausted,
+         ready, ready_codes, published}, ...]}
+    Only tiers that actually have KUs or posts are listed.
+
+    Rules:
+    - total      = every KU extracted for that product+tier
+    - available  = KUs still 'unused' (a post combining 2 thin KUs uses up
+                   2, so real remaining posts can be fewer than this)
+    - ready      = CURRENT (non-superseded) posts that passed audit and are
+                   not yet confirmed published or rejected
+    - published  = current posts with status confirmed_published
+    Failed/superseded test attempts are never counted as posts."""
+    products = get_all_products()
+    ku_rows = _fetch_all("knowledge_units", "product_id,tier,status", "ku_id")
+    post_rows = _fetch_all(
+        "generated_content",
+        "product_id,tier,post_code,audit_status,status,superseded",
+        "content_id",
+    )
+
+    ku_stats = {}
+    for k in ku_rows:
+        key = (k["product_id"], k.get("tier"))
+        s = ku_stats.setdefault(key, {"total": 0, "available": 0, "used": 0, "exhausted": 0})
+        s["total"] += 1
+        st = k.get("status")
+        if st == "unused":
+            s["available"] += 1
+        elif st == "exhausted":
+            s["exhausted"] += 1
+        else:
+            s["used"] += 1
+
+    post_stats = {}
+    for c in post_rows:
+        if c.get("superseded"):
+            continue
+        key = (c["product_id"], c.get("tier"))
+        s = post_stats.setdefault(key, {"ready_codes": [], "published": 0})
+        if c.get("status") == "confirmed_published":
+            s["published"] += 1
+        elif c.get("audit_status") == "PASS" and c.get("status") != "rejected":
+            s["ready_codes"].append(c.get("post_code"))
+
+    result = []
+    for p in products:
+        pid = p["product_id"]
+        tiers_seen = {t for (prod, t) in list(ku_stats) + list(post_stats) if prod == pid}
+        ordered = [t for t in TIER_ORDER if t in tiers_seen] + sorted(
+            t for t in tiers_seen if t not in TIER_ORDER and t
+        )
+        tiers = []
+        for t in ordered:
+            k = ku_stats.get((pid, t), {"total": 0, "available": 0, "used": 0, "exhausted": 0})
+            po = post_stats.get((pid, t), {"ready_codes": [], "published": 0})
+            tiers.append({
+                "tier": t,
+                "label": TIER_LABELS.get(t, t),
+                **k,
+                "ready": len(po["ready_codes"]),
+                "ready_codes": sorted(po["ready_codes"]),
+                "published": po["published"],
+            })
+        result.append({"product_id": pid, "product_name": p["product_name"], "tiers": tiers})
+    return result
+
+
+def get_kus_for_product_tier(product_id, tier):
+    """On-demand KU list for ONE product+tier (oldest first). Only used by
+    /kus — never part of the dashboard itself."""
+    res = (
+        get_client().table("knowledge_units")
+        .select("ku_id,category,core_insight,status,extracted_at")
+        .eq("product_id", product_id).eq("tier", tier)
+        .order("extracted_at", desc=False).execute()
+    )
+    return res.data or []
+
+
 # ---------- Simple key-value settings (used for the pinned live dashboard) ----------
 
 def get_setting(key: str):
