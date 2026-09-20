@@ -32,8 +32,20 @@ _client = None
 # genuine errors (bad API key, invalid request) since retrying those just
 # wastes time and hides a real problem.
 _RETRYABLE_STATUS_CODES = {429, 500, 503, 504}
-_MAX_RETRIES = 2
-_BASE_DELAY_SECONDS = 1.5
+# CHANGED 2026-09-20: was 2 attempts / 1.5s. A real 503 "high demand" spike
+# lasted longer than that and killed a whole Handbook upload right after the
+# expensive extraction call had already succeeded. Now 5 attempts with growing
+# waits (3s, 6s, 12s, 24s = ~45s) before falling back to Groq.
+_MAX_RETRIES = 5
+_BASE_DELAY_SECONDS = 3.0
+_MAX_DELAY_SECONDS = 24.0
+
+# Groq's free tier counts the prompt PLUS the requested max_tokens against a
+# small per-minute budget, so the fallback is only attempted for prompts that
+# can realistically fit, and with a capped output size. Large jobs (e.g. a full
+# product extraction) are simply not sent to Groq.
+_GROQ_MAX_PROMPT_CHARS = 16000
+_GROQ_MAX_OUTPUT_TOKENS = 4000
 
 
 class _ContentBlock:
@@ -52,16 +64,23 @@ def _call_groq_fallback(prompt: str, max_tokens: int = None) -> str:
     """One-shot emergency fallback to Groq's free API (OpenAI-compatible)
     when Gemini is temporarily down. Only called after Gemini has already
     exhausted its own retries. Requires GROQ_API_KEY — if it's not set,
-    this function is never reached (see the caller above)."""
+    this function is never reached (see the caller above).
+
+    CHANGED 2026-09-20: the first real use returned "HTTP Error 403:
+    Forbidden". Groq sits behind Cloudflare, which commonly blocks Python's
+    default urllib User-Agent, so an explicit User-Agent is now sent, and the
+    response body of any HTTP error is logged so the true reason is visible in
+    Render's logs instead of a bare status code. Output size is capped (see
+    _GROQ_MAX_OUTPUT_TOKENS)."""
     import json
+    import urllib.error
     import urllib.request
 
     body = {
         "model": config.GROQ_FALLBACK_MODEL,
         "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": min(max_tokens or _GROQ_MAX_OUTPUT_TOKENS, _GROQ_MAX_OUTPUT_TOKENS),
     }
-    if max_tokens:
-        body["max_tokens"] = max_tokens
 
     req = urllib.request.Request(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -69,11 +88,20 @@ def _call_groq_fallback(prompt: str, max_tokens: int = None) -> str:
         headers={
             "Authorization": f"Bearer {config.GROQ_API_KEY}",
             "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; ICOS-bot/1.0)",
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", errors="replace")[:400]
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"Groq HTTP {e.code}: {detail}") from e
     return data["choices"][0]["message"]["content"]
 
 
@@ -118,7 +146,10 @@ class _Messages:
             except Exception as e:
                 last_error = e
                 if attempt < _MAX_RETRIES and _is_retryable(e):
-                    time.sleep(_BASE_DELAY_SECONDS * attempt)
+                    delay = min(_BASE_DELAY_SECONDS * (2 ** (attempt - 1)), _MAX_DELAY_SECONDS)
+                    print(f"[ai_client] Gemini attempt {attempt}/{_MAX_RETRIES} failed "
+                          f"({str(e)[:60]}...) — retrying in {delay:.0f}s.", flush=True)
+                    time.sleep(delay)
                     continue
                 break  # retries exhausted (or non-retryable) — fall through below
 
@@ -128,7 +159,10 @@ class _Messages:
         # keeps generation/audit moving during a temporary Gemini outage instead
         # of failing the attempt outright. Gemini remains primary; this never
         # runs unless Gemini has already failed.
-        if _is_retryable(last_error) and config.GROQ_API_KEY:
+        if _is_retryable(last_error) and config.GROQ_API_KEY and len(prompt) > _GROQ_MAX_PROMPT_CHARS:
+            print(f"[ai_client] Groq fallback skipped: prompt too large "
+                  f"({len(prompt)} chars) for Groq's free-tier limits.", flush=True)
+        elif _is_retryable(last_error) and config.GROQ_API_KEY:
             try:
                 text = _call_groq_fallback(prompt, max_tokens)
                 print("[ai_client] Gemini unavailable after retries — used Groq fallback.", flush=True)
