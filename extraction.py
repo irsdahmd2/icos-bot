@@ -342,13 +342,25 @@ def filter_duplicate_kus(new_kus: list, existing_insights: list) -> list:
     )
     new_list = "\n".join(f"{i}: {ku.get('core_insight', '')}" for i, ku in enumerate(new_kus))
 
-    response = get_client().messages.create(
-        model=config.AI_MODEL,
-        max_tokens=1500,
-        messages=[{"role": "user", "content": DEDUP_PROMPT.format(
-            existing_list=existing_list, new_list=new_list
-        )}]
-    )
+    try:
+        response = get_client().messages.create(
+            model=config.AI_MODEL,
+            max_tokens=1500,
+            messages=[{"role": "user", "content": DEDUP_PROMPT.format(
+                existing_list=existing_list, new_list=new_list
+            )}]
+        )
+    except Exception as e:
+        # 2026-09-20: a temporary AI outage here used to throw away a
+        # successful (and quota-costly) extraction. For the FIRST tier of a
+        # product there is nothing stored to duplicate, so keep the fresh KUs.
+        # For a later tier (e.g. Codex after Handbook) duplicate protection
+        # matters, so surface the error and let the upload be retried.
+        if not existing_insights:
+            print(f"[extraction] Duplicate check unavailable ({str(e)[:80]}) — "
+                  f"keeping all {len(new_kus)} extracted KUs (first tier).", flush=True)
+            return new_kus
+        raise
     raw = _strip_code_fences(response.content[0].text.strip())
     try:
         keep_indices = set(json.loads(raw))
