@@ -1,8 +1,8 @@
 """
 ICOS Audit Engine — LinkedIn Audit Engine v2.2 (LOCKED, per Irshad's spec document).
 
-Implements the official 12 audit categories from the locked spec, plus three
-code-level structural checks that are deterministic rather than AI-judged
+Implements the official 12 audit categories from the locked spec, plus four
+code-level checks that are deterministic rather than AI-judged
 (more reliable, and they're facts, not opinions):
 
 CODE-LEVEL (facts, not judgment calls):
@@ -10,6 +10,10 @@ CODE-LEVEL (facts, not judgment calls):
   - structure_check           : 80-140 total words (v2.2 rule, replaces paragraph counting)
   - hook_length_check         : opening paragraph <= 210 chars (mobile "See more" cutoff)
   - hashtags_check             : 3-5 relevant hashtags present at the end
+  - protected_terms_check     : (added 2026-09-20) FAILS if the post contains any of
+                                the source Knowledge Unit's protected_terms (the
+                                product's internal names/acronyms/formulas) —
+                                enforces the Proprietary Protection Rule with zero AI calls
 
 AI-JUDGED (the 11 remaining official categories, one combined call):
   2. knowledge_unit_integrity
@@ -183,6 +187,20 @@ def _hashtags_check(content_text: str) -> dict:
     return {"result": "FAIL", "reason": f"{n} hashtags found — need {MIN_HASHTAGS}-{MAX_HASHTAGS}."}
 
 
+def _protected_terms_check(content_text: str, protected_terms: list) -> dict:
+    """Code-level, deterministic (2026-09-20 Proprietary Protection Rule):
+    the post must not expose the product's internal names, acronyms or
+    formulas. Multi-word names match case-insensitively; short ALL-CAPS
+    acronyms match case-sensitively as whole words."""
+    for term in protected_terms or []:
+        if not term:
+            continue
+        flags = 0 if (term.isupper() and " " not in term) else re.IGNORECASE
+        if re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", content_text, flags):
+            return {"result": "FAIL", "reason": f"Exposes an internal product term: '{term}'."}
+    return {"result": "PASS", "reason": "No internal product terms exposed."}
+
+
 def _is_hashtag_line(line: str) -> bool:
     words = line.split()
     if not words:
@@ -202,6 +220,10 @@ def run_audit(content_text: str, product_name: str, product_id: str, ku_id: str,
         "hook_length_check": _hook_length_check(content_text),
         "hashtags_check": _hashtags_check(content_text),
     }
+    ku_row = db.get_knowledge_unit(ku_id) if ku_id else None
+    results["protected_terms_check"] = _protected_terms_check(
+        content_text, (ku_row or {}).get("protected_terms") or []
+    )
 
     recent_posts = db.get_recent_passed_content(product_id, platform, limit=5)
     other_platform_posts = db.get_recent_content_other_platforms(product_id, ku_id, platform, limit=3)
