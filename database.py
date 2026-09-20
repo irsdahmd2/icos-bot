@@ -1,0 +1,733 @@
+"""
+ICOS Database Layer — Supabase (Postgres) edition
+Implements: Product -> Knowledge Unit -> CIP -> Platform Content -> Publication
+Plus Content Ecosystem Memory, the Master Scheduler's daily-state, and the
+Post ID sequence.
+
+IMPORTANT FOR NON-TECHNICAL USE: this is the ONLY file that knows the database
+is Supabase. Every other file calls these functions by name and has no idea
+what's behind them.
+
+CHANGED 2026-09-05:
+- Freeform product naming (no more fixed code list) — add_or_get_product()
+- Master Scheduler support — get_or_create_todays_active_product(),
+  mark_platform_completed_today(), get_remaining_platforms_today()
+- Post ID convention (Product/Tier/###) — next_post_code()
+- editorial_intent is now actually saved (was always "" before — the bug
+  from the earlier checklist item 3)
+- Refine-creates-a-new-version support — save_new_version()
+- Full status model instead of just approved/rejected —
+  update_content_status()
+- KU combining — get_unused_knowledge_units(), mark_kus_used()
+"""
+
+import json
+import re
+import uuid
+from datetime import datetime, timezone, date, timedelta
+
+from supabase import create_client, Client
+
+import config
+
+_client: Client = None
+
+
+def get_client() -> Client:
+    global _client
+    if _client is None:
+        if not config.SUPABASE_URL or not config.SUPABASE_KEY:
+            raise RuntimeError(
+                "SUPABASE_URL / SUPABASE_KEY not set. Create a free project at "
+                "https://supabase.com, then set these as environment variables."
+            )
+        _client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+    return _client
+
+
+def init_db():
+    """Checks the connection actually works, so a missing key or un-run
+    schema fails loudly here instead of silently later mid-pipeline."""
+    try:
+        get_client().table("products").select("product_id").limit(1).execute()
+    except Exception as e:
+        raise RuntimeError(
+            "Could not reach the 'products' table in Supabase. Make sure you've "
+            "run schema.sql AND schema_update_2026-09-05.sql in the Supabase SQL "
+            "Editor, and that SUPABASE_URL / SUPABASE_KEY are correct. "
+            "Original error: " + str(e)
+        )
+
+
+def new_id(prefix=""):
+    return f"{prefix}{uuid.uuid4().hex[:12]}"
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def today():
+    return date.today().isoformat()
+
+
+# ---------- Products (freeform naming) ----------
+
+def _slugify_code(product_name: str) -> str:
+    """Turns a freeform product name into a short readable code, e.g.
+    'Household Operating System' -> 'HOS'. Falls back to first letters
+    of the raw string if there are no clean words."""
+    words = re.findall(r"[A-Za-z0-9]+", product_name)
+    if not words:
+        return "PROD"
+    code = "".join(w[0] for w in words).upper()
+    return code[:8] if code else "PROD"
+
+
+def find_product_by_name(product_name: str):
+    """Case-insensitive lookup so re-uploading the same product under a
+    different tier reuses the same product_id instead of creating a duplicate."""
+    res = get_client().table("products").select("*").execute()
+    for row in res.data:
+        if row["product_name"].strip().lower() == product_name.strip().lower():
+            return row
+    return None
+
+
+def add_or_get_product(product_name: str, tier: str, source_filename: str):
+    """Freeform product entry point. If this product name already exists
+    (from an earlier tier upload), reuse its product_id. Otherwise generate
+    a short unique code from the name and create a new row."""
+    existing = find_product_by_name(product_name)
+    if existing:
+        return existing["product_id"]
+
+    base_code = _slugify_code(product_name)
+    code = base_code
+    suffix = 1
+    # Guard against code collisions between differently-named products
+    # that happen to share initials.
+    existing_codes = {r["product_id"] for r in get_client().table("products").select("product_id").execute().data}
+    while code in existing_codes:
+        suffix += 1
+        code = f"{base_code}{suffix}"
+
+    get_client().table("products").insert({
+        "product_id": code,
+        "product_name": product_name,
+        "tier": tier,
+        "source_filename": source_filename,
+        "uploaded_at": now(),
+    }).execute()
+    return code
+
+
+def get_all_products():
+    res = get_client().table("products").select("*").order("uploaded_at").execute()
+    return res.data
+
+
+# ---------- Knowledge Units ----------
+
+def add_knowledge_unit(product_id, tier, category, core_insight, raw_source_text):
+    ku_id = new_id("ku_")
+    get_client().table("knowledge_units").insert({
+        "ku_id": ku_id,
+        "product_id": product_id,
+        "tier": tier,
+        "category": category,
+        "core_insight": core_insight,
+        "raw_source_text": raw_source_text,
+        "status": "unused",
+        "extracted_at": now(),
+    }).execute()
+    return ku_id
+
+
+def get_all_core_insights_for_product(product_id):
+    """Every core_insight already stored for this product, across ALL tiers
+    (Codex, Handbook, Full OS) uploaded so far — used to check new candidate
+    KUs from a newly-uploaded tier against what's already been captured, so
+    the same underlying insight reworded across tiers isn't saved twice."""
+    res = get_client().table("knowledge_units").select("core_insight").eq("product_id", product_id).execute()
+    return [row["core_insight"] for row in res.data if row.get("core_insight")]
+
+
+def get_knowledge_unit(ku_id):
+    res = get_client().table("knowledge_units").select("*").eq("ku_id", ku_id).execute()
+    return res.data[0] if res.data else None
+
+
+def get_unused_knowledge_units(product_id, limit=1, exclude_ids=None):
+    """Get up to `limit` unused KUs for this product, oldest first,
+    optionally excluding specific ku_ids (used when combining)."""
+    exclude_ids = exclude_ids or []
+    query = (
+        get_client()
+        .table("knowledge_units")
+        .select("*")
+        .eq("product_id", product_id)
+        .eq("status", "unused")
+        .order("extracted_at", desc=False)
+        .limit(limit + len(exclude_ids))
+    )
+    res = query.execute()
+    rows = [r for r in res.data if r["ku_id"] not in exclude_ids]
+    return rows[:limit]
+
+
+def mark_kus_used(ku_ids: list):
+    for ku_id in ku_ids:
+        get_client().table("knowledge_units").update({"status": "used"}).eq("ku_id", ku_id).execute()
+
+
+def mark_kus_exhausted(ku_ids: list):
+    """A KU that failed audit MAX_AUDIT_RETRIES times in a row — mark it so
+    future generation runs skip it instead of retrying the same weak
+    material forever. Distinct from 'used' so it's traceable later."""
+    for ku_id in ku_ids:
+        get_client().table("knowledge_units").update({"status": "exhausted"}).eq("ku_id", ku_id).execute()
+
+
+# ---------- CIP ----------
+
+def save_cip(ku_id, dimensions: dict):
+    cip_id = new_id("cip_")
+    get_client().table("cip").insert({
+        "cip_id": cip_id,
+        "ku_id": ku_id,
+        "core_insight": dimensions.get("core_insight", ""),
+        "real_life_situation": dimensions.get("real_life_situation", ""),
+        "hidden_issue": dimensions.get("hidden_issue", ""),
+        "psychological_dimension": dimensions.get("psychological_dimension", ""),
+        "behavioral_dimension": dimensions.get("behavioral_dimension", ""),
+        "positive_value": dimensions.get("positive_value", ""),
+        "negative_value": dimensions.get("negative_value", ""),
+        "common_behaviour": dimensions.get("common_behaviour", ""),
+        "alternative_perspective": dimensions.get("alternative_perspective", ""),
+        "practical_insight": dimensions.get("practical_insight", ""),
+        "reflection": dimensions.get("reflection", ""),
+        "curiosity_bridge": dimensions.get("curiosity_bridge", ""),
+        "overlooked_fact": dimensions.get("overlooked_fact", ""),
+        "misconception": dimensions.get("misconception", ""),
+        "decision_point": dimensions.get("decision_point", ""),
+        "communication_problem": dimensions.get("communication_problem", ""),
+        "operational_problem": dimensions.get("operational_problem", ""),
+        "what_if_scenario": dimensions.get("what_if_scenario", ""),
+        "what_if_ignored": dimensions.get("what_if_ignored", ""),
+        "created_at": now(),
+    }).execute()
+    return cip_id
+
+
+def get_latest_cip_for_ku(ku_id):
+    res = (
+        get_client()
+        .table("cip")
+        .select("*")
+        .eq("ku_id", ku_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+# ---------- Ecosystem Memory (anti-repetition) ----------
+
+def get_used_intents(ku_id, platform):
+    res = (
+        get_client()
+        .table("ecosystem_history")
+        .select("editorial_intent")
+        .eq("ku_id", ku_id)
+        .eq("platform", platform)
+        .execute()
+    )
+    return [r["editorial_intent"] for r in res.data]
+
+
+def log_ecosystem_use(ku_id, platform, editorial_intent):
+    get_client().table("ecosystem_history").insert({
+        "id": new_id("eco_"),
+        "ku_id": ku_id,
+        "platform": platform,
+        "editorial_intent": editorial_intent,
+        "used_at": now(),
+    }).execute()
+
+
+def get_recent_passed_content(product_id: str, platform: str, limit: int = 5):
+    """Most recent PASSING posts for this product+platform — used by the
+    Duplication/Repetition and Novelty/Editorial Angle audits so a new post
+    is checked against what's actually been published before, not judged
+    in isolation."""
+    res = (
+        get_client().table("generated_content")
+        .select("content_text", "editorial_intent")
+        .eq("product_id", product_id).eq("platform", platform)
+        .eq("audit_status", "PASS")
+        .order("generated_at", desc=True).limit(limit).execute()
+    )
+    return res.data
+
+
+def get_recent_content_other_platforms(product_id: str, ku_id: str, exclude_platform: str, limit: int = 3):
+    """Recent passing posts for the SAME Knowledge Unit on OTHER platforms —
+    used by the Cross-Platform Contamination audit to make sure LinkedIn
+    isn't just a copy of the Blog/Facebook version of the same insight."""
+    res = (
+        get_client().table("generated_content")
+        .select("content_text", "platform")
+        .eq("product_id", product_id).eq("ku_id", ku_id)
+        .neq("platform", exclude_platform)
+        .eq("audit_status", "PASS")
+        .order("generated_at", desc=True).limit(limit).execute()
+    )
+    return res.data
+
+
+def get_other_product_names(exclude_product_id: str):
+    """Every OTHER product's name — used by the Source & Product Identity
+    audit to deterministically catch cross-product contamination in code,
+    rather than leaving it to AI judgment alone."""
+    res = get_client().table("products").select("product_name").neq("product_id", exclude_product_id).execute()
+    return [r["product_name"] for r in res.data]
+
+
+# ---------- Post ID convention: ProductId/Tier/### ----------
+
+def next_post_code(product_id, tier):
+    res = (
+        get_client().table("post_sequence").select("*")
+        .eq("product_id", product_id).eq("tier", tier).execute()
+    )
+    if res.data:
+        n = res.data[0]["last_number"] + 1
+        get_client().table("post_sequence").update({"last_number": n}).eq(
+            "product_id", product_id).eq("tier", tier).execute()
+    else:
+        n = 1
+        get_client().table("post_sequence").insert({
+            "product_id": product_id, "tier": tier, "last_number": n
+        }).execute()
+    return f"{product_id}/{tier}/{n:03d}"
+
+
+# ---------- Generated Content ----------
+
+def save_generated_content(ku_id, cip_id, product_id, tier, platform,
+                            editorial_intent, content_text, post_code, version=1):
+    content_id = new_id("content_")
+    get_client().table("generated_content").insert({
+        "content_id": content_id,
+        "ku_id": ku_id,
+        "cip_id": cip_id,
+        "product_id": product_id,
+        "tier": tier,
+        "platform": platform,
+        "editorial_intent": editorial_intent,
+        "content_text": content_text,
+        "post_code": post_code,
+        "version": version,
+        "status": "generated",
+        "generated_at": now(),
+    }).execute()
+    return content_id
+
+
+def save_new_version(old_content_id, new_content_text, new_editorial_intent):
+    """REFINE creates a new version of the SAME post_code, not a new post
+    (locked rule, 2026-09-05). Marks the old row superseded and inserts a
+    new row carrying the same post_code/ku/product/platform, version+1."""
+    old = get_content(old_content_id)
+    if not old:
+        return None
+    get_client().table("generated_content").update({"superseded": True}).eq(
+        "content_id", old_content_id).execute()
+
+    content_id = new_id("content_")
+    get_client().table("generated_content").insert({
+        "content_id": content_id,
+        "ku_id": old["ku_id"],
+        "cip_id": old["cip_id"],
+        "product_id": old["product_id"],
+        "tier": old.get("tier"),
+        "platform": old["platform"],
+        "editorial_intent": new_editorial_intent,
+        "content_text": new_content_text,
+        "post_code": old["post_code"],
+        "version": (old.get("version") or 1) + 1,
+        "status": "generated",
+        "generated_at": now(),
+    }).execute()
+    return content_id
+
+
+def update_audit_result(content_id, audit_status, audit_results: dict):
+    get_client().table("generated_content").update({
+        "status": "audited",
+        "audit_status": audit_status,
+        "audit_results": audit_results,
+    }).eq("content_id", content_id).execute()
+
+
+def update_content_status(content_id, status):
+    """status in: telegram_delivered, ready_to_publish, manually_published,
+    confirmed_published, rejected"""
+    payload = {"status": status}
+    if status == "confirmed_published":
+        payload["publication_status"] = "published"
+        payload["published_at"] = now()
+    get_client().table("generated_content").update(payload).eq("content_id", content_id).execute()
+
+
+def get_content(content_id):
+    res = get_client().table("generated_content").select("*").eq("content_id", content_id).execute()
+    return res.data[0] if res.data else None
+
+
+# ---------- Master Scheduler: daily active product + platform tracking ----------
+
+def _last_active_product_id():
+    res = (
+        get_client().table("daily_state").select("active_product_id")
+        .order("state_date", desc=True).limit(1).execute()
+    )
+    return res.data[0]["active_product_id"] if res.data else None
+
+
+def get_or_create_todays_active_product():
+    """The Master Scheduler's ONLY job: pick one active product for today,
+    via simple round-robin, and remember it. Returns the daily_state row,
+    or None if no products exist yet."""
+    t = today()
+    existing = get_client().table("daily_state").select("*").eq("state_date", t).execute()
+    if existing.data:
+        return existing.data[0]
+
+    products = get_all_products()
+    if not products:
+        return None
+
+    last_id = _last_active_product_id()
+    ids = [p["product_id"] for p in products]
+    if last_id in ids:
+        idx = ids.index(last_id)
+        next_product_id = ids[(idx + 1) % len(ids)]
+    else:
+        next_product_id = ids[0]
+
+    row = {
+        "id": new_id("day_"),
+        "state_date": t,
+        "active_product_id": next_product_id,
+        "platforms_completed": [],
+        "created_at": now(),
+    }
+    get_client().table("daily_state").insert(row).execute()
+    return row
+
+
+def mark_platform_completed_today(platform):
+    t = today()
+    res = get_client().table("daily_state").select("*").eq("state_date", t).execute()
+    if not res.data:
+        return
+    state = res.data[0]
+    completed = state.get("platforms_completed") or []
+    if platform not in completed:
+        completed.append(platform)
+        get_client().table("daily_state").update(
+            {"platforms_completed": completed}
+        ).eq("id", state["id"]).execute()
+
+
+def get_remaining_platforms_today(all_platforms):
+    t = today()
+    res = get_client().table("daily_state").select("platforms_completed").eq("state_date", t).execute()
+    completed = res.data[0]["platforms_completed"] if res.data else []
+    return [p for p in all_platforms if p not in completed]
+
+
+# ---------- Status (used by /status command) ----------
+
+def get_status_counts():
+    client = get_client()
+    products = client.table("products").select("product_id", count="exact").execute()
+    kus = client.table("knowledge_units").select("ku_id", count="exact").execute()
+    published = (
+        client.table("generated_content")
+        .select("content_id", count="exact")
+        .eq("status", "confirmed_published")
+        .execute()
+    )
+    return products.count or 0, kus.count or 0, published.count or 0
+
+
+def get_per_product_dashboard():
+    """Serial# | Product | KU counts per tier + total | posts generated |
+    audit-passed | awaiting publish (with actual Post IDs) | confirmed
+    published. Returns a list of dicts, one per product."""
+    products = get_all_products()
+    rows = []
+    for p in products:
+        kus = get_client().table("knowledge_units").select("tier", count="exact").eq(
+            "product_id", p["product_id"]).execute().data
+        counts = {"Full_OS": 0, "Handbook": 0, "Codex": 0}
+        for ku in kus:
+            t = ku.get("tier")
+            if t in counts:
+                counts[t] += 1
+        total_kus = sum(counts.values())
+
+        content_rows = get_client().table("generated_content").select(
+            "post_code", "audit_status", "status"
+        ).eq("product_id", p["product_id"]).execute().data
+        posts_generated = len(content_rows)
+        audit_passed = len([c for c in content_rows if c.get("audit_status") == "PASS"])
+        confirmed_published = len([c for c in content_rows if c.get("status") == "confirmed_published"])
+        # Passed audit but not yet confirmed published — the actual backlog
+        # waiting on you, with real Post IDs, not just a count.
+        awaiting = [
+            c["post_code"] for c in content_rows
+            if c.get("audit_status") == "PASS" and c.get("status") != "confirmed_published"
+        ]
+
+        rows.append({
+            "product_id": p["product_id"],
+            "product_name": p["product_name"],
+            **counts,
+            "total_kus": total_kus,
+            "posts_generated": posts_generated,
+            "audit_passed": audit_passed,
+            "awaiting_publish_count": len(awaiting),
+            "awaiting_publish_codes": awaiting,
+            "confirmed_published": confirmed_published,
+        })
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# NEW 2026-09-19 — Dashboard v3: one line per Product + Tier.
+# Shows how many Knowledge Units are still AVAILABLE out of the total
+# extracted, plus how many current posts are ready to publish / published.
+# The KU text itself is NOT part of this — it is fetched on demand only
+# (get_kus_for_product_tier, used by the /kus command).
+# get_per_product_dashboard() above is left untouched (the plain-language
+# stats Q&A still uses it).
+# ---------------------------------------------------------------------------
+
+TIER_ORDER = ["Full_OS", "Handbook", "Codex"]
+TIER_LABELS = {"Full_OS": "Full OS", "Handbook": "Handbook", "Codex": "Codex"}
+
+
+def _fetch_all(table, columns, order_col, page=1000):
+    """Reads EVERY row of a table in pages. Supabase silently caps a single
+    request at 1000 rows, and the full catalog (~78 products x up to 3
+    tiers x up to 100 KUs) can pass that, so a plain .execute() could
+    quietly under-count."""
+    rows, start = [], 0
+    while True:
+        res = (
+            get_client().table(table).select(columns)
+            .order(order_col).range(start, start + page - 1).execute()
+        )
+        batch = res.data or []
+        rows.extend(batch)
+        if len(batch) < page:
+            break
+        start += page
+    return rows
+
+
+def get_dashboard_by_tier():
+    """Returns a list (one dict per product, upload order) like:
+    {product_id, product_name, tiers: [
+        {tier, label, total, available, used, exhausted,
+         ready, ready_codes, published}, ...]}
+    Only tiers that actually have KUs or posts are listed.
+
+    Rules:
+    - total      = every KU extracted for that product+tier
+    - available  = KUs still 'unused' (a post combining 2 thin KUs uses up
+                   2, so real remaining posts can be fewer than this)
+    - ready      = CURRENT (non-superseded) posts that passed audit and are
+                   not yet confirmed published or rejected
+    - published  = current posts with status confirmed_published
+    Failed/superseded test attempts are never counted as posts."""
+    products = get_all_products()
+    ku_rows = _fetch_all("knowledge_units", "product_id,tier,status", "ku_id")
+    post_rows = _fetch_all(
+        "generated_content",
+        "product_id,tier,post_code,audit_status,status,superseded",
+        "content_id",
+    )
+
+    ku_stats = {}
+    for k in ku_rows:
+        key = (k["product_id"], k.get("tier"))
+        s = ku_stats.setdefault(key, {"total": 0, "available": 0, "used": 0, "exhausted": 0})
+        s["total"] += 1
+        st = k.get("status")
+        if st == "unused":
+            s["available"] += 1
+        elif st == "exhausted":
+            s["exhausted"] += 1
+        else:
+            s["used"] += 1
+
+    post_stats = {}
+    for c in post_rows:
+        if c.get("superseded"):
+            continue
+        key = (c["product_id"], c.get("tier"))
+        s = post_stats.setdefault(key, {"ready_codes": [], "published": 0})
+        if c.get("status") == "confirmed_published":
+            s["published"] += 1
+        elif c.get("audit_status") == "PASS" and c.get("status") != "rejected":
+            s["ready_codes"].append(c.get("post_code"))
+
+    result = []
+    for p in products:
+        pid = p["product_id"]
+        tiers_seen = {t for (prod, t) in list(ku_stats) + list(post_stats) if prod == pid}
+        ordered = [t for t in TIER_ORDER if t in tiers_seen] + sorted(
+            t for t in tiers_seen if t not in TIER_ORDER and t
+        )
+        tiers = []
+        for t in ordered:
+            k = ku_stats.get((pid, t), {"total": 0, "available": 0, "used": 0, "exhausted": 0})
+            po = post_stats.get((pid, t), {"ready_codes": [], "published": 0})
+            tiers.append({
+                "tier": t,
+                "label": TIER_LABELS.get(t, t),
+                **k,
+                "ready": len(po["ready_codes"]),
+                "ready_codes": sorted(po["ready_codes"]),
+                "published": po["published"],
+            })
+        result.append({"product_id": pid, "product_name": p["product_name"], "tiers": tiers})
+    return result
+
+
+def get_kus_for_product_tier(product_id, tier):
+    """On-demand KU list for ONE product+tier (oldest first). Only used by
+    /kus — never part of the dashboard itself."""
+    res = (
+        get_client().table("knowledge_units")
+        .select("ku_id,category,core_insight,status,extracted_at")
+        .eq("product_id", product_id).eq("tier", tier)
+        .order("extracted_at", desc=False).execute()
+    )
+    return res.data or []
+
+
+# ---------- Simple key-value settings (used for the pinned live dashboard) ----------
+
+def get_setting(key: str):
+    res = get_client().table("bot_settings").select("value").eq("key", key).execute()
+    return res.data[0]["value"] if res.data else None
+
+
+def set_setting(key: str, value: str):
+    existing = get_client().table("bot_settings").select("key").eq("key", key).execute()
+    if existing.data:
+        get_client().table("bot_settings").update({"value": value}).eq("key", key).execute()
+    else:
+        get_client().table("bot_settings").insert({"key": key, "value": value}).execute()
+
+
+# ---------------------------------------------------------------------------
+# ENGAGEMENT TRACKING — NEW 2026-09-13. Lets Irshad send a LinkedIn (or later,
+# any platform) analytics screenshot to the bot every 4-5 days, and have the
+# actual like/comment/share numbers stored against the real Post ID, so
+# quarterly/half-yearly trend questions ("which angle/product performs best")
+# can be answered from real data instead of guessing.
+# ---------------------------------------------------------------------------
+
+def get_published_posts_by_platform(platform, limit=100):
+    """ALL confirmed-published posts for ONE specific platform — used for
+    precise screenshot matching, not just the most recent handful. Matching
+    is scoped to a single platform first (detected from the screenshot's UI)
+    so a LinkedIn screenshot is never compared against Blog or Instagram
+    posts, and vice versa."""
+    res = get_client().table("generated_content").select(
+        "content_id", "post_code", "platform", "content_text", "published_at"
+    ).eq("status", "confirmed_published").eq("platform", platform).order(
+        "published_at", desc=True
+    ).limit(limit).execute()
+    return res.data
+
+
+def get_recent_published_posts(limit=8):
+    """Most recently confirmed-published posts, for the 'which post is this
+    screenshot for?' confirmation step — never auto-attach engagement data
+    to a post without the user confirming which one it is."""
+    res = get_client().table("generated_content").select(
+        "content_id", "post_code", "platform", "content_text", "published_at"
+    ).eq("status", "confirmed_published").order("published_at", desc=True).limit(limit).execute()
+    return res.data
+
+
+def save_post_engagement(content_id, post_code, platform, likes, comments, shares, impressions, notes=""):
+    eng_id = new_id("eng_")
+    get_client().table("post_engagement").insert({
+        "engagement_id": eng_id,
+        "content_id": content_id,
+        "post_code": post_code,
+        "platform": platform,
+        "likes": likes or 0,
+        "comments": comments or 0,
+        "shares": shares or 0,
+        "impressions": impressions,
+        "recorded_at": now(),
+        "notes": notes or "",
+    }).execute()
+    return eng_id
+
+
+def get_engagement_report(days=None):
+    """Real engagement rows, joined with each post's angle and product, for
+    trend analysis (weekly / quarterly / half-yearly). If days is given,
+    only engagement RECORDED in that window — not post-published date —
+    since a post can gain engagement well after it was first published."""
+    query = get_client().table("post_engagement").select(
+        "post_code", "platform", "likes", "comments", "shares", "impressions", "recorded_at", "content_id"
+    ).order("recorded_at", desc=True)
+    res = query.execute()
+    rows = res.data
+    if days:
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        rows = [r for r in rows if r["recorded_at"] >= cutoff]
+
+    # Enrich with editorial angle + product for genuine "what performs best" analysis
+    enriched = []
+    for r in rows:
+        content = get_client().table("generated_content").select(
+            "editorial_angle", "product_id"
+        ).eq("content_id", r["content_id"]).execute().data
+        angle = content[0]["editorial_angle"] if content else ""
+        product_id = content[0]["product_id"] if content else ""
+        enriched.append({**r, "editorial_angle": angle, "product_id": product_id})
+    return enriched
+
+
+def get_recent_activity_counts(days=7):
+    """Posts generated / audit-passed / confirmed-published within the last
+    N days, broken down by platform — powers weekly/monthly Q&A answers."""
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    rows = get_client().table("generated_content").select(
+        "platform", "audit_status", "status", "generated_at", "published_at"
+    ).gte("generated_at", cutoff).execute().data
+
+    by_platform = {}
+    for r in rows:
+        p = r.get("platform", "unknown")
+        by_platform.setdefault(p, {"generated": 0, "audit_passed": 0, "published": 0})
+        by_platform[p]["generated"] += 1
+        if r.get("audit_status") == "PASS":
+            by_platform[p]["audit_passed"] += 1
+        if r.get("status") == "confirmed_published":
+            by_platform[p]["published"] += 1
+    return by_platform
