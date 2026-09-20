@@ -162,39 +162,59 @@ DASHBOARD_MSG_ID_KEY = "pinned_dashboard_message_id"
 
 
 def _render_dashboard_text():
-    rows = db.get_per_product_dashboard()
+    rows = db.get_dashboard_by_tier()
     if not rows:
         return "📊 Dashboard (live)\n\nNo products uploaded yet."
-    lines = ["📊 Dashboard (live — stays updated in place)\n"]
+    lines = ["📊 ICOS Dashboard (live — stays updated in place)"]
     for i, r in enumerate(rows, 1):
-        block = (
-            f"{i}. {r['product_name']}\n"
-            f"   📚 KUs extracted — Total: {r['total_kus']} "
-            f"(Full OS: {r['Full_OS']} | Handbook: {r['Handbook']} | Codex: {r['Codex']})\n"
-            f"   ✍️ Posts generated: {r['posts_generated']} | ✅ Audit passed: {r['audit_passed']}\n"
-            f"   📤 Confirmed published: {r['confirmed_published']}"
-        )
-        if r["awaiting_publish_count"]:
-            codes = ", ".join(r["awaiting_publish_codes"])
-            block += f"\n   🟡 Awaiting publish ({r['awaiting_publish_count']}): {codes}"
-        lines.append(block)
-    return "\n\n".join(lines)
+        block = [f"\n{i}. {r['product_name']} ({r['product_id']})"]
+        if not r["tiers"]:
+            block.append("   No tiers uploaded yet.")
+        for t in r["tiers"]:
+            extra = []
+            if t["used"]:
+                extra.append(f"{t['used']} used")
+            if t["exhausted"]:
+                extra.append(f"{t['exhausted']} skipped")
+            extra_txt = f" ({', '.join(extra)})" if extra else ""
+            block.append(f"   • {t['label']} — {t['available']} of {t['total']} KUs available{extra_txt}")
+            ready_txt = f"✅ Ready to publish: {t['ready']}"
+            if 0 < t["ready"] <= 4:
+                ready_txt += " (" + ", ".join(t["ready_codes"]) + ")"
+            block.append(f"     {ready_txt} · 📤 Published: {t['published']}")
+        lines.append("\n".join(block))
+    text = "\n".join(lines)
+    limit = 3900  # Telegram's hard cap is 4096 characters per message
+    if len(text) > limit:
+        text = text[:limit].rsplit("\n", 1)[0] + "\n\n… more products — tap 🔍 below or use /kus"
+    return text
+
+
+def _dashboard_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔍 Show KU details", callback_data="kus|menu")]])
 
 
 async def refresh_pinned_dashboard(chat_id, context: ContextTypes.DEFAULT_TYPE):
     """Keeps ONE message updated in place with current stats, pinned to the
     top — so you can delete every other message in the chat each day and
     this one stays put with the real numbers."""
+    from telegram.error import BadRequest
     text = _render_dashboard_text()
     msg_id = db.get_setting(DASHBOARD_MSG_ID_KEY)
     if msg_id:
         try:
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=int(msg_id), text=text)
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=int(msg_id), text=text, reply_markup=_dashboard_keyboard()
+            )
             return
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return  # numbers unchanged — nothing to update, do NOT post a duplicate
+            logger.info(f"Pinned dashboard message gone, sending a fresh one: {e}")
         except Exception as e:
             logger.info(f"Pinned dashboard message gone, sending a fresh one: {e}")
 
-    sent = await context.bot.send_message(chat_id=chat_id, text=text)
+    sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=_dashboard_keyboard())
     try:
         await context.bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id, disable_notification=True)
     except Exception as e:
@@ -203,7 +223,98 @@ async def refresh_pinned_dashboard(chat_id, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update):
+        return
     await refresh_pinned_dashboard(update.effective_chat.id, context)
+
+
+# ---------- On-demand KU details (NOT part of the dashboard) ----------
+
+def _split_for_telegram(text: str, limit: int = 3800):
+    """Splits long text at line breaks so each piece fits in one message."""
+    parts, current = [], ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > limit and current:
+            parts.append(current)
+            current = ""
+        current += line + "\n"
+    if current.strip():
+        parts.append(current)
+    return parts
+
+
+async def kus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/kus — pick a product, then a tier, to see its Knowledge Units."""
+    if not _owner_only(update):
+        return
+    await _send_kus_menu(update.effective_chat.id, context)
+
+
+async def _send_kus_menu(chat_id, context: ContextTypes.DEFAULT_TYPE):
+    rows = [r for r in db.get_dashboard_by_tier() if r["tiers"]]
+    if not rows:
+        await context.bot.send_message(chat_id=chat_id, text="No Knowledge Units yet — upload a product first.")
+        return
+    buttons = [
+        [InlineKeyboardButton(f"{r['product_name']} ({r['product_id']})", callback_data=f"kus|p|{r['product_id']}")]
+        for r in rows[:99]
+    ]
+    await context.bot.send_message(
+        chat_id=chat_id, text="🔍 Which product's Knowledge Units do you want to see?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _send_ku_list(chat_id, context: ContextTypes.DEFAULT_TYPE, product_id: str, tier: str):
+    icons = {"unused": "🟢", "used": "🔵", "exhausted": "⚪"}
+    kus = db.get_kus_for_product_tier(product_id, tier)
+    label = db.TIER_LABELS.get(tier, tier)
+    if not kus:
+        await context.bot.send_message(chat_id=chat_id, text=f"No KUs found for {product_id} · {label}.")
+        return
+    lines = [f"📚 {product_id} · {label} — {len(kus)} KUs", "🟢 available  🔵 used  ⚪ skipped", ""]
+    for n, k in enumerate(kus, 1):
+        insight = " ".join((k.get("core_insight") or "").split())
+        if len(insight) > 140:
+            insight = insight[:137] + "..."
+        cat = f"[{k['category']}] " if k.get("category") else ""
+        lines.append(f"{n}. {icons.get(k.get('status'), '🔵')} {cat}{insight}")
+    for part in _split_for_telegram("\n".join(lines)):
+        await context.bot.send_message(chat_id=chat_id, text=part)
+
+
+async def handle_kus_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not _owner_only(update):
+        await _safe_answer(query)
+        return
+    await _safe_answer(query)
+    chat_id = query.message.chat_id
+    parts = query.data.split("|")
+    action = parts[1] if len(parts) > 1 else "menu"
+
+    if action == "menu":
+        await _send_kus_menu(chat_id, context)
+    elif action == "p" and len(parts) >= 3:
+        product_id = parts[2]
+        rows = {r["product_id"]: r for r in db.get_dashboard_by_tier()}
+        prod = rows.get(product_id)
+        tiers = [t for t in (prod["tiers"] if prod else []) if t["total"]]
+        if not tiers:
+            await context.bot.send_message(chat_id=chat_id, text="No KUs for that product yet.")
+        elif len(tiers) == 1:
+            await _send_ku_list(chat_id, context, product_id, tiers[0]["tier"])
+        else:
+            buttons = [
+                [InlineKeyboardButton(f"{t['label']} ({t['total']})", callback_data=f"kus|t|{product_id}|{t['tier']}")]
+                for t in tiers
+            ]
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"Which tier of {prod['product_name']}?",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+    elif action == "t" and len(parts) >= 4:
+        await _send_ku_list(chat_id, context, parts[2], parts[3])
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -738,6 +849,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("dashboard", dashboard))
+    app.add_handler(CommandHandler("kus", kus_command))
     app.add_handler(CommandHandler("generate", generate))
     app.add_handler(CommandHandler("insights", insights))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -745,6 +857,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.add_handler(CallbackQueryHandler(handle_menu_choice, pattern=r"^menu\|"))
+    app.add_handler(CallbackQueryHandler(handle_kus_callback, pattern=r"^kus\|"))
     app.add_handler(CallbackQueryHandler(handle_tier_choice, pattern=r"^tier\|"))
     app.add_handler(CallbackQueryHandler(handle_platform_choice, pattern=r"^gen\|"))
     app.add_handler(CallbackQueryHandler(handle_refine, pattern=r"^refine\|"))
