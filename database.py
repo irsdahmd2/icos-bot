@@ -129,7 +129,10 @@ def get_all_products():
 
 # ---------- Knowledge Units ----------
 
-def add_knowledge_unit(product_id, tier, category, core_insight, raw_source_text):
+def add_knowledge_unit(product_id, tier, category, core_insight, raw_source_text, protected_terms=None):
+    """protected_terms (added 2026-09-20): the product's internal names/acronyms
+    that appear in this KU's source text. Kept out of the CIP and enforced by
+    audits.py so posts never expose internal framework terminology."""
     ku_id = new_id("ku_")
     get_client().table("knowledge_units").insert({
         "ku_id": ku_id,
@@ -138,6 +141,7 @@ def add_knowledge_unit(product_id, tier, category, core_insight, raw_source_text
         "category": category,
         "core_insight": core_insight,
         "raw_source_text": raw_source_text,
+        "protected_terms": protected_terms or [],
         "status": "unused",
         "extracted_at": now(),
     }).execute()
