@@ -64,6 +64,7 @@ def process_new_product(product_name: str, tier: str, source_filename: str, raw_
             category=ku.get("category", ""),
             core_insight=ku.get("core_insight", ""),
             raw_source_text=ku.get("source_excerpt", ""),
+            protected_terms=ku.get("protected_terms", []),
         )
         saved += 1
 
@@ -137,7 +138,10 @@ def generate_for_platform(product_id: str, product_name: str, tier: str, platfor
 
     for ku in ku_group:
         if not db.get_latest_cip_for_ku(ku["ku_id"]):
-            dims = extraction.build_cip(ku["core_insight"], ku.get("category", ""), ku.get("raw_source_text", ""))
+            dims = extraction.build_cip(
+                ku["core_insight"], ku.get("category", ""), ku.get("raw_source_text", ""),
+                ku.get("protected_terms") or [],
+            )
             db.save_cip(ku["ku_id"], dims)
 
     merged_cip = _merge_cips(ku_group)
