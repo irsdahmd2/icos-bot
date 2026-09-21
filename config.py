@@ -26,6 +26,15 @@ OWNER_TELEGRAM_ID = os.environ.get("OWNER_TELEGRAM_ID", "")
 # --- AI Provider: Google Gemini (free tier, no card required) ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 AI_MODEL = "gemini-3.6-flash"
+# NEW 2026-09-21: tried in this order when AI_MODEL is overloaded (503) or its
+# free daily quota is used up (429). All are current stable Gemini models per
+# Google's model list; each has its own capacity and its own free quota.
+GEMINI_FALLBACK_MODELS = [
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+]
 
 # --- Fallback AI Provider: Groq (free tier, no card required) ---
 # Used ONLY when Gemini is temporarily overloaded/unavailable after its own
