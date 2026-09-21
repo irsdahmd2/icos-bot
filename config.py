@@ -58,9 +58,14 @@ TIER_KU_TARGET = {
     # worth of extractable insight. New ranges are set to genuinely scale
     # with each tier's real page count (Codex 6-10pp, Handbook 35-50pp,
     # Full OS 150+pp), not an arbitrary round number.
-    "Full_OS": (40, 100),
-    "Handbook": (20, 50),
-    "Codex": (3, 8),
+    # CHANGED 2026-09-20: only the SECOND number is used now (a ceiling, not a
+    # target). One KU = one teachable idea, and a single section of a product
+    # usually holds several, so the old ceilings (Handbook 50 / Codex 8) were
+    # capping supply far below what the documents contain. Extraction still
+    # stops when only repetition remains.
+    "Full_OS": (40, 250),
+    "Handbook": (20, 120),
+    "Codex": (3, 40),
 }
 
 # RAISED 2026-09-13: extraction was silently truncating product text to the
@@ -91,6 +96,13 @@ MAX_KU_COMBINE = 2  # LOWERED 2026-09-13: was 5 — silently collapsing up to 5
 # fails audit, the pipeline retries internally (different angle each time)
 # up to this many attempts before giving up and telling the user honestly
 # that this Knowledge Unit needs attention, instead of showing a failed post.
+# NEW 2026-09-20: how many distinct LinkedIn posts ONE Knowledge Unit may
+# produce over time, each from a genuinely different angle (situation, mistake,
+# warning, ...). Every KU gets its first post before any KU gets a second, so
+# the daily product rotation stays fresh. A KU is retired ('used') once it has
+# this many passing posts, or earlier if it cannot yield a new angle.
+MAX_POSTS_PER_KU = 3
+
 MAX_AUDIT_RETRIES = 3
 
 # The FULL planned platform list (locked spec), shown for progress context in
@@ -98,7 +110,7 @@ MAX_AUDIT_RETRIES = 3
 # ACTIVE_PLATFORMS above is the REAL list the bot can actually generate for.
 ALL_PLANNED_PLATFORMS = [
     "linkedin", "blog", "facebook", "instagram",
-    "pinterest", "youtube_short", "youtube_podcast",
+    "youtube_short", "youtube_podcast",
 ]
 
 # --- Reply Assistant (separate, dedicated bot — screenshot-based LinkedIn replies) ---
