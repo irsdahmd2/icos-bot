@@ -29,6 +29,10 @@ import ai_client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("icos")
+# 2026-09-20: httpx logs every request URL at INFO, and Telegram's URL contains
+# the bot token — it was appearing in plaintext in Render's logs. Quieten it.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # In-memory state for the two-step upload flow (PDF -> ask name -> ask tier).
 # Keyed by chat_id. This resets if the bot restarts, which is fine — it only
