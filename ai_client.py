@@ -36,7 +36,13 @@ _RETRYABLE_STATUS_CODES = {429, 500, 503, 504}
 # lasted longer than that and killed a whole Handbook upload right after the
 # expensive extraction call had already succeeded. Now 5 attempts with growing
 # waits (3s, 6s, 12s, 24s = ~45s) before falling back to Groq.
-_MAX_RETRIES = 5
+# CHANGED 2026-09-21: the 5 attempts all hit the SAME overloaded model
+# (gemini-3.6-flash) and all failed over ~3.5 minutes. Attempts are now spread
+# across a chain of different Gemini models (config.GEMINI_FALLBACK_MODELS).
+# Each model has its own capacity pool AND its own free daily quota, so this
+# also multiplies the free requests available per day.
+_PRIMARY_ATTEMPTS = 3      # waits 3s, 6s between them
+_FALLBACK_ATTEMPTS = 2     # per fallback model, wait 3s between them
 _BASE_DELAY_SECONDS = 3.0
 _MAX_DELAY_SECONDS = 24.0
 
@@ -129,29 +135,43 @@ class _Messages:
         if max_tokens:
             gen_config = types.GenerateContentConfig(max_output_tokens=max_tokens)
 
+        models = [self._model_name] + [
+            m for m in getattr(config, "GEMINI_FALLBACK_MODELS", []) if m != self._model_name
+        ]
         last_error = None
-        for attempt in range(1, _MAX_RETRIES + 1):
-            try:
-                response = self._client.models.generate_content(
-                    model=self._model_name,
-                    contents=prompt,
-                    config=gen_config,
-                )
+        for idx, model_name in enumerate(models):
+            attempts = _PRIMARY_ATTEMPTS if idx == 0 else _FALLBACK_ATTEMPTS
+            for attempt in range(1, attempts + 1):
                 try:
-                    text = response.text
-                except Exception:
-                    # Gemini sometimes returns no text if it hit a safety filter etc.
-                    text = ""
-                return _Response(text)
-            except Exception as e:
-                last_error = e
-                if attempt < _MAX_RETRIES and _is_retryable(e):
-                    delay = min(_BASE_DELAY_SECONDS * (2 ** (attempt - 1)), _MAX_DELAY_SECONDS)
-                    print(f"[ai_client] Gemini attempt {attempt}/{_MAX_RETRIES} failed "
-                          f"({str(e)[:60]}...) — retrying in {delay:.0f}s.", flush=True)
-                    time.sleep(delay)
-                    continue
-                break  # retries exhausted (or non-retryable) — fall through below
+                    response = self._client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=gen_config,
+                    )
+                    try:
+                        text = response.text
+                    except Exception:
+                        # Gemini sometimes returns no text if it hit a safety filter etc.
+                        text = ""
+                    if idx > 0:
+                        print(f"[ai_client] {self._model_name} unavailable — answered by "
+                              f"fallback model {model_name}.", flush=True)
+                    return _Response(text)
+                except Exception as e:
+                    last_error = e
+                    retryable = _is_retryable(e)
+                    if not retryable and idx == 0:
+                        raise  # a real error (bad key, bad request) on the main model: surface it
+                    if retryable and attempt < attempts:
+                        delay = min(_BASE_DELAY_SECONDS * (2 ** (attempt - 1)), _MAX_DELAY_SECONDS)
+                        print(f"[ai_client] {model_name} attempt {attempt}/{attempts} failed "
+                              f"({str(e)[:60]}...) — retrying in {delay:.0f}s.", flush=True)
+                        time.sleep(delay)
+                        continue
+                    print(f"[ai_client] {model_name} unavailable ({str(e)[:60]}...) — "
+                          f"trying the next model." if idx + 1 < len(models) else
+                          f"[ai_client] {model_name} unavailable ({str(e)[:60]}...).", flush=True)
+                    break  # next model
 
         # Gemini failed after exhausting its own retries. If this was a genuine
         # overload/unavailable error (not a bad key or malformed request) and a
