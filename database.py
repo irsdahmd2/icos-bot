@@ -53,7 +53,7 @@ def init_db():
     except Exception as e:
         raise RuntimeError(
             "Could not reach the 'products' table in Supabase. Make sure you've "
-            "run schema.sql AND schema_update_2026-09-05.sql in the Supabase SQL "
+            "run schema.sql in the Supabase SQL "
             "Editor, and that SUPABASE_URL / SUPABASE_KEY are correct. "
             "Original error: " + str(e)
         )
@@ -261,6 +261,38 @@ def log_ecosystem_use(ku_id, platform, editorial_intent):
     }).execute()
 
 
+def count_passed_posts_by_ku(product_id: str, platform: str) -> dict:
+    """{ku_id: number of DISTINCT passing posts} for this product+platform.
+    Counted by post_code so a REFINE (new version, same post_code) is not a
+    second post. Used to let one KU yield several posts over time."""
+    res = (
+        get_client().table("generated_content")
+        .select("ku_id,post_code")
+        .eq("product_id", product_id).eq("platform", platform)
+        .eq("audit_status", "PASS")
+        .limit(1000).execute()
+    )
+    codes = {}
+    for r in res.data or []:
+        codes.setdefault(r["ku_id"], set()).add(r.get("post_code"))
+    return {k: len(v) for k, v in codes.items()}
+
+
+def get_passed_posts_for_ku(ku_id: str, platform: str, limit: int = 3):
+    """This Knowledge Unit's own earlier passing posts on this platform (latest
+    version of each), newest first. Lets a second post on the same idea be
+    written, and audited, against the first one."""
+    res = (
+        get_client().table("generated_content")
+        .select("content_text,editorial_intent,superseded,generated_at")
+        .eq("ku_id", ku_id).eq("platform", platform)
+        .eq("audit_status", "PASS")
+        .order("generated_at", desc=True).limit(limit * 3).execute()
+    )
+    rows = [r for r in (res.data or []) if not r.get("superseded")]
+    return rows[:limit]
+
+
 def get_recent_passed_content(product_id: str, platform: str, limit: int = 5):
     """Most recent PASSING posts for this product+platform — used by the
     Duplication/Repetition and Novelty/Editorial Angle audits so a new post
@@ -268,12 +300,15 @@ def get_recent_passed_content(product_id: str, platform: str, limit: int = 5):
     in isolation."""
     res = (
         get_client().table("generated_content")
-        .select("content_text", "editorial_intent")
+        .select("content_text", "editorial_intent", "superseded")
         .eq("product_id", product_id).eq("platform", platform)
         .eq("audit_status", "PASS")
-        .order("generated_at", desc=True).limit(limit).execute()
+        .order("generated_at", desc=True).limit(limit * 3).execute()
     )
-    return res.data
+    # 2026-09-20: skip superseded versions — otherwise a REFINE'd post was
+    # compared against its own earlier version and flagged as a duplicate.
+    rows = [r for r in (res.data or []) if not r.get("superseded")]
+    return rows[:limit]
 
 
 def get_recent_content_other_platforms(product_id: str, ku_id: str, exclude_platform: str, limit: int = 3):
