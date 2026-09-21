@@ -112,9 +112,13 @@ CHECKS:
 7. product_protection — reveals the problem/situation/insight but does NOT reveal a complete
    protocol, framework, proprietary matrix, internal architecture, or internal scoring/decision
    mechanism.
-8. curiosity_and_cta — progression is value -> recognition -> insight -> reflection -> curiosity
-   -> product; the CTA belongs only to "{product_name}", feels like a natural next step, and does
-   not mention any other product.
+8. curiosity_and_cta — the post must satisfy ALL of these (FAIL if any is missing): (a) solves one
+   genuine problem; (b) teaches something memorable; (c) answers one real question AND leaves one
+   new question open that only a complete structured system could answer; (d) does not reveal a
+   full framework, protocol or method; (e) naturally implies a larger operating system exists
+   without shouting "buy"; (f) a professional would save it and want to learn more. The soft
+   product line belongs only to "{product_name}", reads as a natural next step, and mentions no
+   other product.
 9. cross_platform_contamination — {contamination_instruction}
 10. ordinary_content_test — if the INAYA branding were removed, could this be mistaken for generic
     AI-generated LinkedIn content? PASS means NO (it feels original and specific).
@@ -226,10 +230,15 @@ def run_audit(content_text: str, product_name: str, product_id: str, ku_id: str,
     )
 
     recent_posts = db.get_recent_passed_content(product_id, platform, limit=5)
+    # 2026-09-20: a KU may yield several posts; this KU's own earlier posts are
+    # checked FIRST so a second post cannot just restate the first.
+    own_posts = db.get_passed_posts_for_ku(ku_id, platform, limit=3) if ku_id else []
+    seen_texts = {r["content_text"] for r in own_posts}
+    recent_posts = own_posts + [r for r in recent_posts if r["content_text"] not in seen_texts]
     other_platform_posts = db.get_recent_content_other_platforms(product_id, ku_id, platform, limit=3)
 
     if recent_posts:
-        excerpts = "\n---\n".join(p["content_text"][:400] for p in recent_posts)
+        excerpts = "\n---\n".join(p["content_text"][:400] for p in recent_posts[:6])
         recent_posts_block = f"THIS PRODUCT'S PREVIOUS PASSING LINKEDIN POSTS:\n---\n{excerpts}\n---"
     else:
         recent_posts_block = "THIS PRODUCT'S PREVIOUS LINKEDIN POSTS: none yet — this is the first."
