@@ -160,6 +160,13 @@ topic and insight (not a fixed recycled set) — always include one INAYA/produc
 them (e.g. #{product_name_tag}), the rest should vary post to post based on what this specific
 post is actually about.
 
+ONE QUESTION ANSWERED, ONE OPENED (added 2026-09-20, ICOS constitution): the post fully answers ONE
+real question the reader has (that is the insight and practical edge), and leaves exactly ONE new
+question open that only a complete, structured system could answer. Imply it; never announce it.
+Roughly 80% immediate value, 20% mystery. Never reveal the full method or step list, and never leave
+the reader feeling they now know everything. Do not use em dashes, and avoid "it isn't X, it's Y"
+contrast sentences (they read as machine-written).
+
 VOICE (locked): Professional, Human, Calm, Practical, Evidence-aware, Intellectually useful,
 Minimal, Operational. It should feel like an experienced person explaining an important
 professional reality — not a company trying to sell something.
