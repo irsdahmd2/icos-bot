@@ -32,11 +32,6 @@ try:
     GENERATORS["facebook"] = generator_facebook
 except ImportError:
     pass
-try:
-    import generator_pinterest
-    GENERATORS["pinterest"] = generator_pinterest
-except ImportError:
-    pass
 
 import audits
 
@@ -46,7 +41,7 @@ def process_new_product(product_name: str, tier: str, source_filename: str, raw_
     summary dict for the Telegram confirmation message."""
     product_id = db.add_or_get_product(product_name, tier, source_filename)
 
-    ku_dicts = extraction.extract_knowledge_units(raw_text, tier)
+    ku_dicts = extraction.extract_knowledge_units(raw_text, tier, product_name)
     candidate_count = len(ku_dicts)
 
     # Cross-tier dedup: if this product already has KUs from a different tier
@@ -96,24 +91,57 @@ def _merge_cips(ku_group: list) -> dict:
     return merged
 
 
-def _get_ku_group_for_generation(product_id: str, thin_word_threshold: int = 15) -> list:
-    """Locked rule (2026-09-05, threshold lowered 2026-09-13): combine up to
-    config.MAX_KU_COMBINE (now 2) unused KUs into one post ONLY when a single
-    KU's core insight is genuinely fragment-thin on its own. Threshold lowered
-    from 35 to 15 words — most solid 1-2 sentence insights are 20-40 words and
-    should stand alone as their own post; the old threshold was merging far
-    more KUs than necessary, cutting total publishable post count."""
-    first = db.get_unused_knowledge_units(product_id, limit=1)
-    if not first:
+def _get_ku_group_for_generation(product_id: str, platform: str = "linkedin", thin_word_threshold: int = 15) -> list:
+    """Pick the next Knowledge Unit for this product.
+
+    CHANGED 2026-09-20: a KU can now yield several posts (config.MAX_POSTS_PER_KU),
+    each from a new angle. Order: KUs with the FEWEST passing posts first (so every
+    KU gets its first post before any gets a second), then KUs with solid source
+    text before thin ones, then oldest first.
+
+    Thin-KU combining (unchanged): combine up to config.MAX_KU_COMBINE unused KUs
+    into one post ONLY when a single KU's core insight is genuinely fragment-thin
+    (under thin_word_threshold words)."""
+    candidates = db.get_unused_knowledge_units(product_id, limit=500)
+    if not candidates:
         return []
-    ku = first[0]
+    counts = db.count_passed_posts_by_ku(product_id, platform)
+
+    def sort_key(k):
+        thin = len(k.get("raw_source_text") or "") < 250
+        return (counts.get(k["ku_id"], 0), thin, k.get("extracted_at") or "")
+
+    candidates.sort(key=sort_key)
+    ku = candidates[0]
     group = [ku]
-    if len(ku["core_insight"].split()) < thin_word_threshold:
+    if len(ku["core_insight"].split()) < thin_word_threshold and counts.get(ku["ku_id"], 0) == 0:
         more = db.get_unused_knowledge_units(
             product_id, limit=config.MAX_KU_COMBINE - 1, exclude_ids=[ku["ku_id"]]
         )
         group.extend(more)
     return group
+
+
+def _kus_after_pass(ku_group: list, platform: str):
+    """After a passing post: the primary KU is retired only once it has
+    reached config.MAX_POSTS_PER_KU distinct passing posts; other KUs that were
+    merged into this post are retired immediately (their content is now used)."""
+    primary = ku_group[0]
+    counts = db.count_passed_posts_by_ku(primary["product_id"], platform)
+    if counts.get(primary["ku_id"], 0) >= config.MAX_POSTS_PER_KU:
+        db.mark_kus_used([primary["ku_id"]])
+    rest = [k["ku_id"] for k in ku_group[1:]]
+    if rest:
+        db.mark_kus_used(rest)
+
+
+def _anti_repeat_posts(product_id: str, ku_id: str, platform: str) -> list:
+    """This KU's own earlier posts FIRST (so a second post on the same idea is
+    forced onto new ground), then the product's most recent posts."""
+    own = db.get_passed_posts_for_ku(ku_id, platform, limit=3)
+    recent = db.get_recent_passed_content(product_id, platform, limit=5)
+    seen = {r["content_text"] for r in own}
+    return own + [r for r in recent if r["content_text"] not in seen]
 
 
 def generate_for_platform(product_id: str, product_name: str, tier: str, platform: str) -> dict:
@@ -132,7 +160,7 @@ def generate_for_platform(product_id: str, product_name: str, tier: str, platfor
     if not generator:
         return {"error": f"No generator built yet for '{platform}'."}
 
-    ku_group = _get_ku_group_for_generation(product_id)
+    ku_group = _get_ku_group_for_generation(product_id, platform)
     if not ku_group:
         return {"error": "No unused Knowledge Units left for this product."}
 
@@ -151,7 +179,7 @@ def generate_for_platform(product_id: str, product_name: str, tier: str, platfor
     attempts_failed = []
     for attempt in range(1, config.MAX_AUDIT_RETRIES + 1):
         avoid_intents = db.get_used_intents(primary_ku["ku_id"], platform)
-        recent_posts = db.get_recent_passed_content(product_id, platform, limit=5)
+        recent_posts = _anti_repeat_posts(product_id, primary_ku["ku_id"], platform)
         content_text, editorial_intent = generator.generate(merged_cip, product_name, avoid_intents, recent_posts)
         post_code = db.next_post_code(product_id, tier)
         content_id = db.save_generated_content(
@@ -167,7 +195,7 @@ def generate_for_platform(product_id: str, product_name: str, tier: str, platfor
         db.log_ecosystem_use(primary_ku["ku_id"], platform, editorial_intent)
 
         if audit_status == "PASS":
-            db.mark_kus_used([ku["ku_id"] for ku in ku_group])
+            _kus_after_pass(ku_group, platform)
             return {
                 "content_id": content_id, "post_code": post_code, "platform": platform,
                 "content_text": content_text, "editorial_intent": editorial_intent,
@@ -178,7 +206,12 @@ def generate_for_platform(product_id: str, product_name: str, tier: str, platfor
         failed_checks = [k for k, v in audit_results.items() if v.get("result") == "FAIL"]
         attempts_failed.append(failed_checks)
 
-    db.mark_kus_exhausted([ku["ku_id"] for ku in ku_group])
+    # A KU that already produced a passing post has simply run out of fresh
+    # angles: retire it as 'used'. One that never produced anything is 'exhausted'.
+    if db.count_passed_posts_by_ku(primary_ku["product_id"], platform).get(primary_ku["ku_id"], 0) > 0:
+        db.mark_kus_used([ku["ku_id"] for ku in ku_group])
+    else:
+        db.mark_kus_exhausted([ku["ku_id"] for ku in ku_group])
     return {
         "error": (
             f"Couldn't produce a passing post after {config.MAX_AUDIT_RETRIES} attempts "
@@ -207,7 +240,7 @@ def refine(content_id: str, product_name: str) -> dict:
     latest_content_id = content_id
     for attempt in range(1, config.MAX_AUDIT_RETRIES + 1):
         avoid_intents = db.get_used_intents(old["ku_id"], old["platform"])
-        recent_posts = db.get_recent_passed_content(old["product_id"], old["platform"], limit=5)
+        recent_posts = _anti_repeat_posts(old["product_id"], old["ku_id"], old["platform"])
         content_text, editorial_intent = generator.generate(cip, product_name, avoid_intents, recent_posts)
         new_content_id = db.save_new_version(latest_content_id, content_text, editorial_intent)
         latest_content_id = new_content_id
