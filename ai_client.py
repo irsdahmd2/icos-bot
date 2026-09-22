@@ -151,8 +151,26 @@ class _Messages:
                     try:
                         text = response.text
                     except Exception:
-                        # Gemini sometimes returns no text if it hit a safety filter etc.
-                        text = ""
+                        text = None
+                    if text is None:
+                        # 2026-09-22 REAL BUG FOUND IN PRODUCTION: Gemini can return a reply
+                        # with NO text (e.g. a safety filter silently blocked it, or the
+                        # candidate had no parts) without raising an exception at all — the
+                        # try/except above only catches actual exceptions, so `text` stayed
+                        # None and crashed the very next line downstream
+                        # (`response.content[0].text.strip()` -> "'NoneType' object has no
+                        # attribute 'strip'"). Treated as a retryable failure instead, same
+                        # as an overload, so it retries/falls back rather than crashing.
+                        last_error = RuntimeError(f"{model_name} returned an empty reply (no text).")
+                        if attempt < attempts:
+                            delay = min(_BASE_DELAY_SECONDS * (2 ** (attempt - 1)), _MAX_DELAY_SECONDS)
+                            print(f"[ai_client] {model_name} returned no text (attempt "
+                                  f"{attempt}/{attempts}) — retrying in {delay:.0f}s.", flush=True)
+                            time.sleep(delay)
+                            continue
+                        print(f"[ai_client] {model_name} returned no text after {attempts} "
+                              f"attempts — trying the next model.", flush=True)
+                        break
                     if idx > 0:
                         print(f"[ai_client] {self._model_name} unavailable — answered by "
                               f"fallback model {model_name}.", flush=True)
