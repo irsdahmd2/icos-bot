@@ -12,6 +12,7 @@ CHANGED 2026-09-05:
 - refine() implements the REFINE button: new version of the same post, re-audited
 """
 
+import re
 import config
 import database as db
 import extraction
@@ -177,10 +178,13 @@ def generate_for_platform(product_id: str, product_name: str, tier: str, platfor
     cip_id = (db.get_latest_cip_for_ku(primary_ku["ku_id"]) or {}).get("cip_id")
 
     attempts_failed = []
+    avoid_terms = []
     for attempt in range(1, config.MAX_AUDIT_RETRIES + 1):
         avoid_intents = db.get_used_intents(primary_ku["ku_id"], platform)
         recent_posts = _anti_repeat_posts(product_id, primary_ku["ku_id"], platform)
-        content_text, editorial_intent = generator.generate(merged_cip, product_name, avoid_intents, recent_posts)
+        content_text, editorial_intent = generator.generate(
+            merged_cip, product_name, avoid_intents, recent_posts, avoid_terms=avoid_terms
+        )
         post_code = db.next_post_code(product_id, tier)
         content_id = db.save_generated_content(
             ku_id=primary_ku["ku_id"], cip_id=cip_id, product_id=product_id, tier=tier,
@@ -205,21 +209,38 @@ def generate_for_platform(product_id: str, product_name: str, tier: str, platfor
 
         failed_checks = [k for k, v in audit_results.items() if v.get("result") == "FAIL"]
         attempts_failed.append(failed_checks)
+        # 2026-09-22: if a protected internal term slipped in, tell the NEXT
+        # attempt exactly which word(s) to avoid, instead of blindly re-rolling
+        # and hoping it dodges the same word by chance.
+        pt = audit_results.get("protected_terms_check", {})
+        if pt.get("result") == "FAIL":
+            found = re.findall(r"'([^']+)'", pt.get("reason", ""))
+            avoid_terms.extend(t for t in found if t not in avoid_terms)
 
-    # A KU that already produced a passing post has simply run out of fresh
-    # angles: retire it as 'used'. One that never produced anything is 'exhausted'.
-    if db.count_passed_posts_by_ku(primary_ku["product_id"], platform).get(primary_ku["ku_id"], 0) > 0:
+    all_failed = sorted(set(sum(attempts_failed, [])))
+    # 2026-09-22: a KU is only genuinely unusable if it failed for a CONTENT
+    # reason (too thin, weak value, etc). If EVERY failure was purely a
+    # protected-terms collision, the source material was fine — the wording
+    # just needs another try later — so the KU is left as 'unused' rather
+    # than permanently discarded. A KU that already has a passing post has
+    # simply run out of fresh angles: retire it as 'used'.
+    passed_before = db.count_passed_posts_by_ku(primary_ku["product_id"], platform).get(primary_ku["ku_id"], 0) > 0
+    only_terms_issue = all_failed == ["protected_terms_check"]
+    if passed_before:
         db.mark_kus_used([ku["ku_id"] for ku in ku_group])
+        status_note = "This Knowledge Unit has been marked used (it already has a passing post)."
+    elif only_terms_issue:
+        status_note = ("This Knowledge Unit was left as-is (not discarded) — every attempt only "
+                       "tripped the internal-term check, so the material itself is fine; try "
+                       "/generate again later.")
     else:
         db.mark_kus_exhausted([ku["ku_id"] for ku in ku_group])
+        status_note = "This Knowledge Unit has been marked exhausted — /generate will move to the next one automatically."
     return {
         "error": (
             f"Couldn't produce a passing post after {config.MAX_AUDIT_RETRIES} attempts "
-            f"for this Knowledge Unit. This usually means the source material was too thin "
-            f"or vague for a full post. Recurring failed checks: "
-            f"{', '.join(sorted(set(sum(attempts_failed, []))))}. "
-            f"This Knowledge Unit has been marked exhausted — /generate will move to the "
-            f"next one automatically."
+            f"for this Knowledge Unit. Recurring failed checks: {', '.join(all_failed)}. "
+            f"{status_note}"
         ),
     }
 
@@ -241,7 +262,7 @@ def refine(content_id: str, product_name: str) -> dict:
     for attempt in range(1, config.MAX_AUDIT_RETRIES + 1):
         avoid_intents = db.get_used_intents(old["ku_id"], old["platform"])
         recent_posts = _anti_repeat_posts(old["product_id"], old["ku_id"], old["platform"])
-        content_text, editorial_intent = generator.generate(cip, product_name, avoid_intents, recent_posts)
+        content_text, editorial_intent = generator.generate(cip, product_name, avoid_intents, recent_posts, avoid_terms=[])
         new_content_id = db.save_new_version(latest_content_id, content_text, editorial_intent)
         latest_content_id = new_content_id
 
