@@ -51,7 +51,7 @@ WHAT ONE KNOWLEDGE UNIT (KU) IS
 - Work through the WHOLE document from start to end so every section that teaches something is
   covered. Do not stop early. Real teaching content usually gives one to three KUs per page.
 - Stop when only repetition remains. Never pad. Return at most {max_ku} KUs.
-  (This document is the "{tier}" tier of the product.)
+  (This document is the "{tier}" tier of the product.){part_note}
 - Skip: contents pages, navigation, disclaimers, blank forms/worksheets/logs and instructions on how
   to fill them in. A worksheet only counts through the ideas it teaches; the explanations and
   completed examples around it are the supporting passages.
@@ -189,56 +189,107 @@ MAX_EXCERPT_CHARS = 4000
 FALLBACK_WINDOW_CHARS = 1200
 
 
-def extract_knowledge_units(product_text: str, tier: str, product_name: str = "") -> list:
-    """Send product text to the AI, get back the Knowledge Units (one teachable
-    idea each). Each returned dict has: category, core_insight, source_excerpt
-    (verbatim text sliced from the product), protected_terms (the product-wide
-    list of internal names, attached to every KU)."""
-    text = product_text[:config.EXTRACTION_TEXT_LIMIT]
-    # Only the CEILING of the tier range is given to the model.
-    _min_ku, max_ku = config.TIER_KU_TARGET.get(tier, (3, 40))
+# 2026-09-21: the whole product used to go to the AI in ONE ~52,000-character
+# request. That request was the one that kept failing with 503 "high demand"
+# (heavy requests are the first to be refused), it ran for many minutes, and a
+# single huge pass tends to skim later sections. It is now sent in parts of
+# roughly CHUNK_TARGET_CHARS, split at page boundaries: each request is small
+# and quick, each part is read closely, and finished parts are remembered so a
+# retry after a failure does not repeat them.
+CHUNK_TARGET_CHARS = 14000
+_MAX_KU_PER_PART = 45
+_CHUNK_CACHE = {}
 
+
+def _split_into_parts(text: str, target: int = CHUNK_TARGET_CHARS) -> list:
+    """Split at page boundaries ('Page N of M' markers) into parts of about
+    `target` characters. Falls back to line boundaries when there are none."""
+    if len(text) <= target * 1.25:
+        return [text]
+    cuts = [m.end() for m in _PAGE_MARKER.finditer(text)]
+    if len(cuts) < 2:
+        cuts = [m.end() for m in re.finditer(r"\n", text)]
+    parts, start, last_cut = [], 0, 0
+    for c in cuts:
+        if c - start >= target:
+            parts.append(text[start:c])
+            start = c
+        last_cut = c
+    tail = text[start:]
+    if tail.strip():
+        if parts and len(tail) < target * 0.3:
+            parts[-1] += tail          # don't leave a tiny last part
+        else:
+            parts.append(tail)
+    return [p for p in parts if p.strip()] or [text]
+
+
+def _extract_part(part_text: str, tier: str, max_ku: int, product_name: str,
+                  part_no: int, n_parts: int) -> tuple:
+    """One AI request for one part. Returns (list_of_ku_dicts_without_terms, terms)."""
+    import hashlib
+    key = hashlib.sha1(f"{tier}|{max_ku}|{n_parts}|{product_name}|{part_text}".encode("utf-8", "ignore")).hexdigest()
+    if key in _CHUNK_CACHE:
+        print(f"[extraction] part {part_no}/{n_parts}: reused from an earlier attempt.", flush=True)
+        return _CHUNK_CACHE[key]
+
+    part_note = (f"\n- This text is PART {part_no} OF {n_parts} of the document. Extract only from THIS part."
+                 if n_parts > 1 else "")
     response = get_client().messages.create(
         model=config.AI_MODEL,
-        # RAISED 2026-09-20: 16000 -> 32000. One KU per idea (not per section)
-        # can mean 100+ KUs, and the model also spends hidden reasoning tokens
-        # from this same budget. The reply stays small because passages are
-        # only pointers (see _build_excerpt).
-        max_tokens=32000,
+        max_tokens=16000,
         messages=[{"role": "user", "content": EXTRACTION_PROMPT.format(
-            text=text, tier=tier, max_ku=max_ku, domain_hint=_domain_hint(product_name)
+            text=part_text, tier=tier, max_ku=max_ku, part_note=part_note,
+            domain_hint=_domain_hint(product_name)
         )}]
     )
     raw = _strip_code_fences(response.content[0].text.strip())
-    items, master_terms = _parse_extraction(raw)
-    master_terms = _clean_protected_terms(master_terms)
+    items, terms = _parse_extraction(raw)
 
-    collapsed = _collapse(text)
-    kus, last_pos = [], 0
+    collapsed = _collapse(part_text)
+    kus = []
     for item in items:
         if not isinstance(item, dict):
             continue
         core_insight = str(item.get("core_insight", "")).strip()
         if not core_insight:
             continue
-        excerpt = _build_excerpt(collapsed, item, core_insight)
-        if excerpt:
-            pos = collapsed.find(excerpt[:60])
-            last_pos = max(last_pos, pos)
-        terms = _clean_protected_terms(list(master_terms) + list(item.get("protected_terms") or []))
         kus.append({
             "category": str(item.get("category", "")).strip(),
             "core_insight": core_insight,
-            "source_excerpt": excerpt,
-            "protected_terms": terms,
+            "source_excerpt": _build_excerpt(collapsed, item, core_insight),
+            "_own_terms": item.get("protected_terms") or [],
         })
+    if not kus and len(collapsed) > 3000:
+        print(f"[extraction] WARNING: part {part_no}/{n_parts} returned no KUs.", flush=True)
+    print(f"[extraction] part {part_no}/{n_parts}: {len(kus)} KUs.", flush=True)
+    _CHUNK_CACHE[key] = (kus, terms)
+    return kus, terms
 
-    # Coverage warning (log only): if the last KU's source sits well before the
-    # end of the document, the reply may have been cut short or the model stopped early.
-    if kus and collapsed and last_pos >= 0 and last_pos < 0.7 * len(collapsed):
-        print(f"[extraction] WARNING: KUs only reach {100 * last_pos // len(collapsed)}% of the "
-              f"document ({len(kus)} KUs) — extraction may have stopped early.", flush=True)
-    return kus
+
+def extract_knowledge_units(product_text: str, tier: str, product_name: str = "") -> list:
+    """Extract the Knowledge Units (one teachable idea each) from a product.
+    Each returned dict has: category, core_insight, source_excerpt (verbatim
+    text sliced from the product), protected_terms (the product-wide list of
+    internal names, attached to every KU)."""
+    text = product_text[:config.EXTRACTION_TEXT_LIMIT]
+    # Only the CEILING of the tier range is used.
+    _min_ku, max_ku = config.TIER_KU_TARGET.get(tier, (3, 40))
+    part_ceiling = min(max_ku, _MAX_KU_PER_PART)
+
+    parts = _split_into_parts(text)
+    all_kus, all_terms = [], []
+    for i, part in enumerate(parts, 1):
+        kus, terms = _extract_part(part, tier, part_ceiling, product_name, i, len(parts))
+        all_kus.extend(kus)
+        all_terms.extend(terms if isinstance(terms, list) else [])
+
+    master_terms = _clean_protected_terms(all_terms)
+    out = []
+    for ku in all_kus[:max_ku]:
+        terms = _clean_protected_terms(master_terms + list(ku.pop("_own_terms", [])))
+        out.append({**ku, "protected_terms": terms})
+    return out
 
 
 # ---------- source-excerpt slicing (verbatim, deterministic) ----------
