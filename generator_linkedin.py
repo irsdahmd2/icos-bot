@@ -220,10 +220,22 @@ specified above) — no preamble, no explanation, no headings, no numbered secti
 """
 
 
-def generate(cip: dict, product_name: str, avoid_intents: list = None, recent_posts: list = None) -> tuple:
+def generate(cip: dict, product_name: str, avoid_intents: list = None, recent_posts: list = None, avoid_terms: list = None) -> tuple:
     """Returns (content_text, editorial_angle)."""
     avoid_intents = avoid_intents or []
     recent_posts = recent_posts or []
+    avoid_terms = avoid_terms or []
+
+    if avoid_terms:
+        # 2026-09-22: a previous attempt for this same post leaked one of the
+        # product's internal names. Tell this attempt exactly which word(s) to
+        # steer around, instead of silently re-rolling and hoping.
+        avoid_terms_block = (
+            "\nDo NOT use these exact words/phrases anywhere in the post (rephrase the idea "
+            "without them, in plain language): " + "; ".join(avoid_terms) + "\n"
+        )
+    else:
+        avoid_terms_block = ""
 
     if recent_posts:
         excerpts = "\n---\n".join(p["content_text"][:400] for p in recent_posts[:3])
@@ -235,7 +247,7 @@ def generate(cip: dict, product_name: str, avoid_intents: list = None, recent_po
     else:
         recent_posts_block = ""
 
-    prompt = PROMPT_TEMPLATE.format(
+    prompt = (avoid_terms_block + PROMPT_TEMPLATE).format(
         product_name=product_name,
         product_name_tag=product_name.replace(" ", ""),
         angles=", ".join(ANGLES),
