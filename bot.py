@@ -837,6 +837,28 @@ def _start_keepalive_server_if_needed():
     logger.info(f"Keep-alive server listening on port {port} (Render/cloud mode).")
 
 
+def _start_self_keepalive(url: str, every_seconds: int = 480):
+    """Render's FREE plan puts the service to sleep after 15 minutes with no
+    INBOUND request. A long job (e.g. a product extraction while Gemini is
+    slow) sends no inbound traffic, so on 2026-09-21 Render stopped the bot in
+    the middle of an upload and the user got no answer. This pings the app's own
+    public URL every 8 minutes so it stays awake. Any response (even 404)
+    counts as traffic; errors are ignored."""
+    import threading
+    import time
+    import urllib.request
+
+    def _loop():
+        while True:
+            time.sleep(every_seconds)
+            try:
+                urllib.request.urlopen(url, timeout=20).read(64)
+            except Exception:
+                pass  # a 404/timeout still reached Render's edge as inbound traffic
+
+    threading.Thread(target=_loop, daemon=True, name="self-keepalive").start()
+
+
 def main():
     db.init_db()
     app = (
@@ -887,6 +909,7 @@ def main():
         webhook_path = config.TELEGRAM_BOT_TOKEN  # token-as-path: only Telegram knows this URL
         logger.info(f"ICOS bot starting in WEBHOOK mode on port {port} ({render_url})...")
         logger.info(f"Groq fallback key present: {bool(config.GROQ_API_KEY)}")
+        _start_self_keepalive(render_url)
         app.run_webhook(
             listen="0.0.0.0",
             port=port,
